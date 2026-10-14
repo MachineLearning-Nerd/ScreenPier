@@ -1416,6 +1416,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "screenpier"
+version = "0.1.0"
+dependencies = [
+ "adler2",
+ "anyhow",
+ "axum",
+ "clap",
+ "memmap2",
+ "png",
+ "rand",
+ "rustix",
+ "serde",
+ "serde_json",
+ "str0m",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "wayland-client",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "xkbcommon",
+]
+
+[[package]]
 name = "sctp-proto"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1704,30 +1728,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "tail-window-access"
-version = "0.1.0"
-dependencies = [
- "adler2",
- "anyhow",
- "axum",
- "clap",
- "memmap2",
- "png",
- "rand",
- "rustix",
- "serde",
- "serde_json",
- "str0m",
- "tempfile",
- "thiserror",
- "tokio",
- "wayland-client",
- "wayland-protocols-misc",
- "wayland-protocols-wlr",
- "xkbcommon",
 ]
 
 [[package]]

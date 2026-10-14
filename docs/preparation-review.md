@@ -1,4 +1,4 @@
-# TailWindowAccess preparation review
+# ScreenPier preparation review
 
 The final independent review passed the preparation documents. This verdict covers requirements, proposed architecture, test design, prerequisite ordering, and the local decision trail. It does not establish working remote desktop software.
 

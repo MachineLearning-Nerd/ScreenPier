@@ -1,10 +1,10 @@
+use screenpier::desktop::{
+    Button, Desktop, InputAuthority, KeyCode, Position, Transition, observe_lock,
+};
 use std::{
     fs::File,
     io::BufWriter,
     time::{Duration, Instant},
-};
-use tail_window_access::desktop::{
-    Button, Desktop, InputAuthority, KeyCode, Position, Transition, observe_lock,
 };
 
 fn main() {
@@ -83,7 +83,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if (2..=3).contains(&args.len()) && args[1] == "--allow-clipboard-write" =>
         {
             let mut desktop = Desktop::connect(args.get(2).map_or("eDP-1", String::as_str))?;
-            let expected = "TailWindowAccess clipboard probe\nUTF-8 café";
+            let expected = "ScreenPier clipboard probe\nUTF-8 café";
             desktop.clipboard_write(expected)?;
             if desktop.clipboard_read()? != expected {
                 return Err("clipboard roundtrip did not match".into());

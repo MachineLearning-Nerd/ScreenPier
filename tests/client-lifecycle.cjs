@@ -66,7 +66,7 @@ function harness() {
   requestAnimationFrame:callback=>schedule(callback, 16),
  });
  vm.runInContext(script, context, {filename:'web/index.html'});
- const app = context.window.tailWindowAccess;
+ const app = context.window.screenpier;
  const message = body => app.state.channel.onmessage({data:JSON.stringify(body)});
  function ready() {
   message({type:'hello', epoch:app.state.epoch, input_revision:'0'});

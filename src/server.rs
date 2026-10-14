@@ -320,7 +320,7 @@ pub async fn run(config: Config) -> Result<()> {
             return Err(error.into());
         }
     };
-    println!("TailWindowAccess ready. Open {origin}. Stop with Ctrl+C.");
+    println!("ScreenPier ready. Open {origin}. Stop with Ctrl+C.");
     let shutdown_stop = stopping.clone();
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {

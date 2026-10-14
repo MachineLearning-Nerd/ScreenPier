@@ -1,10 +1,10 @@
-# TailWindowAccess requirements
+# ScreenPier requirements
 
-TailWindowAccess runs on the user's Linux machine. Comet on the user's Mac opens a private Tailscale URL and controls the same desktop shown on the Linux physical monitor.
+ScreenPier runs on the user's Linux machine. Comet on the user's Mac opens a private Tailscale URL and controls the same desktop shown on the Linux physical monitor.
 
 ## Confirmed workflow
 
-The user opens apps and browser pages on Linux, tests them remotely, and leaves the browser session and testing evidence on Linux. Codex or Claude already running there can investigate that evidence using their available tools. TailWindowAccess provides desktop access.
+The user opens apps and browser pages on Linux, tests them remotely, and leaves the browser session and testing evidence on Linux. Codex or Claude already running there can investigate that evidence using their available tools. ScreenPier provides desktop access.
 
 The primary workload is everyday desktop use, browser app testing, Herdr, Codex, terminals, scrolling, and UI animation. Smooth motion and readable text both matter. Watching video is outside the intended workload.
 

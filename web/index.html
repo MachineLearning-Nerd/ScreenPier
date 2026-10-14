@@ -2,12 +2,12 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TailWindowAccess</title>
+<title>ScreenPier</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10141c;color:#e7edf7}*{box-sizing:border-box}body{margin:0;display:flex;flex-direction:column;height:100dvh}header{padding:12px 18px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#192131;border-bottom:1px solid #33415a}h1{font-size:16px;margin:0 12px 0 0}button,select{background:#29374e;color:#edf3ff;border:1px solid #526784;border-radius:7px;padding:8px 12px;font:inherit}button{cursor:pointer}button:hover{background:#3b5274}button:disabled{opacity:.45;cursor:default}#connect{background:#225779}#status{font-size:14px;margin-left:auto;color:#acbdd8}#details{font-size:12px;color:#99aac3;padding:7px 18px;background:#151c28;display:flex;gap:20px;flex-wrap:wrap}label{cursor:pointer}main{flex:1;min-height:0;position:relative;background:#070a10;display:flex;align-items:center;justify-content:center;overflow:hidden}video{width:100%;height:100%;object-fit:contain;outline:none;touch-action:none}video:focus{box-shadow:inset 0 0 0 2px #558bcb}#placeholder{position:absolute;text-align:center;padding:24px;pointer-events:none;max-width:540px;color:#b1c1d8}#placeholder strong{display:block;font-size:23px;margin-bottom:12px}#notice{padding:10px 18px;min-height:39px;color:#bacbe5;background:#192131;font-size:13px}#notice.error{color:#ffb5a8}main:fullscreen{width:100vw;height:100vh}main:fullscreen video{height:100vh}main:fullscreen #placeholder{display:none}
 </style>
 <header>
-<h1>TailWindowAccess</h1>
+<h1>ScreenPier</h1>
 <button id="connect">Connect</button>
 <button id="disconnect" disabled>Disconnect</button>
 <button id="takeover">Take control</button>
@@ -394,6 +394,6 @@ $('copy').onclick=async()=>{
   notice('Linux clipboard text copied to this browser clipboard.');
  } catch(error) {if(clipboardCurrent(session)) notice(error.message||'Browser clipboard permission denied',true);}
 };
-window.tailWindowAccess={connect,disconnect,state};
+window.screenpier={connect,disconnect,state};
 </script>
 </html>

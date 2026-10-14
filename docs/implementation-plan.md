@@ -1,4 +1,4 @@
-# Prepare and build TailWindowAccess
+# Prepare and build ScreenPier
 
 Provide private access from Mac Comet to the existing Linux desktop. Start with desktop control and text clipboard, then verify remote unlock and operation under constrained bandwidth. Preserve the existing Tailscale service.
 

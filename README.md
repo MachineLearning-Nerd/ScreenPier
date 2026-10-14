@@ -1,6 +1,6 @@
-# Use the Linux desktop from a browser
+# ScreenPier
 
-TailWindowAccess runs on this Linux machine. A browser on your Mac displays and controls the same physical Hyprland desktop. Applications and test evidence stay on Linux.
+ScreenPier runs on this Linux machine. A browser on your Mac displays and controls the same physical Hyprland desktop. Applications and test evidence stay on Linux.
 
 This is an early implementation. [Runtime results](docs/runtime.md) separate verified behavior from remaining acceptance checks.
 
@@ -13,32 +13,32 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 node tests/client-lifecycle.cjs
-cargo build --release --bin tail-window-access
+cargo build --release --bin screenpier
 ```
 
 The host needs FFmpeg, libxkbcommon, wl-clipboard, Hyprland's screencopy and virtual input protocols, and Tailscale. Run the application inside the existing graphical login. The current hardware encoder uses the Intel render device at `/dev/dri/by-path/pci-0000:00:02.0-render`.
 
 ## Start private access
 
-The private test machine runs a user service in its graphical session. [The service example](deploy/tail-window-access.service.example) needs your owner login, Tailnet hostname, Tailscale address, output, and executable path before installation. Check an installed service with `systemctl --user status tail-window-access.service`. It must run inside the signed-in Hyprland session. Keep any other Tailscale Serve routes intact.
+ScreenPier must run inside the signed-in Hyprland session. [The service example](deploy/screenpier.service.example) needs your owner login, Tailnet hostname, Tailscale address, output, and executable path before installation as `screenpier.service`. Check an installed service with `systemctl --user status screenpier.service`. Keep any other Tailscale Serve routes intact.
 
 The commands below also support a manual host run when the user service is stopped.
 
 Set these values to your Tailscale login, this machine's Tailscale address, and its HTTPS hostname.
 
 ```sh
-export TWA_OWNER_LOGIN='your-tailscale-login@example.com'
-export TWA_MEDIA_IP='100.64.0.1'
-export TWA_ORIGIN='https://your-host.your-tailnet.ts.net:8443'
+export SCREENPIER_OWNER_LOGIN='your-tailscale-login@example.com'
+export SCREENPIER_MEDIA_IP='100.64.0.1'
+export SCREENPIER_ORIGIN='https://your-host.your-tailnet.ts.net:8443'
 ```
 
 Start the host in a terminal on Linux.
 
 ```sh
-./target/release/tail-window-access \
-  --owner-login "$TWA_OWNER_LOGIN" \
-  --public-origin "$TWA_ORIGIN" \
-  --media-ip "$TWA_MEDIA_IP" \
+./target/release/screenpier \
+  --owner-login "$SCREENPIER_OWNER_LOGIN" \
+  --public-origin "$SCREENPIER_ORIGIN" \
+  --media-ip "$SCREENPIER_MEDIA_IP" \
   --output eDP-1 \
   --encoder vaapi \
   --bitrate-kbps 3000
@@ -76,7 +76,7 @@ The computer must remain awake and signed into Hyprland. An authenticated produc
 
 ## Stop access
 
-For the installed service, run `systemctl --user stop tail-window-access.service`. For a manual host run, press Ctrl+C in its terminal. Remove only this application's proxy when needed.
+For an installed `screenpier.service`, run `systemctl --user stop screenpier.service`. For a manual host run, press Ctrl+C in its terminal. Remove only this application's proxy when needed.
 
 ```sh
 tailscale serve --https=8443 off
@@ -91,7 +91,7 @@ The HTTP listener binds to `127.0.0.1:6080`. WebRTC media binds separately to th
 
 If admission is rejected, check the exact owner login and HTTPS origin. If video is unavailable, check the selected monitor, encoder, and private UDP route. The browser retries transient connection failures for up to one minute. Disconnect cancels recovery. Admission rejection and another controller owning the desktop require an explicit action. A sustained foreground video stall triggers bounded recovery even when control messages continue. If recovery stops, reconnect explicitly. The host status endpoint `/api/status` requires the same owner authentication.
 
-Start with `--diagnostics-log ./tail-window-access.jsonl` to record numeric timing and input counters. The writer runs separately from transport and uses a bounded queue. It creates an owner-only file, rejects symbolic links, and truncates that configured file when it reaches 8 MiB. A logger failure does not interrupt desktop control. `/api/status` reports dropped records and logger failure.
+Start with `--diagnostics-log ./screenpier.jsonl` to record numeric timing and input counters. The writer runs separately from transport and uses a bounded queue. It creates an owner-only file, rejects symbolic links, and truncates that configured file when it reaches 8 MiB. A logger failure does not interrupt desktop control. `/api/status` reports dropped records and logger failure.
 
 Logs include capture, encoding, presentation age, transport scheduling, and input receipt, admission, expiry, cancellation, and backend completion counts. Backend completion does not prove the target application received an event. Duration fields ending in `last_ms` contain the latest sample. Scheduling fields ending in `max_ms` contain the session maximum. Desktop actor counters accumulate for the host lifetime. Logs exclude keys, clipboard contents, passwords, desktop images, controller credentials, and negotiation data.
 

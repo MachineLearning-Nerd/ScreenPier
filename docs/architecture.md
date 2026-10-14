@@ -1,4 +1,4 @@
-# TailWindowAccess architecture
+# ScreenPier architecture
 
 The provisional design is a Rust host with WebRTC desktop video and browser control in Comet. It targets smooth browser testing on the existing Linux desktop. Image updates remain a comparison candidate for exact text and sparse changes. Runtime evidence decides the production transport.
 
@@ -6,7 +6,7 @@ The provisional design is a Rust host with WebRTC desktop video and browser cont
 
 The user keeps Linux awake and signed in. On the Mac, the user connects Tailscale and opens the private app URL in Comet. The app displays the current physical desktop. Clicking, typing, scrolling, and dragging operate Linux directly.
 
-The user tests apps in the Linux browser. Those sessions and any evidence the user saves stay on Linux. Codex and Claude operate through their existing tools. TailWindowAccess handles remote desktop access.
+The user tests apps in the Linux browser. Those sessions and any evidence the user saves stay on Linux. Codex and Claude operate through their existing tools. ScreenPier handles remote desktop access.
 
 ## Candidate comparison
 
