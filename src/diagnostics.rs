@@ -124,6 +124,7 @@ pub struct ActorRecord {
     input_expired: u64,
     input_cancelled: u64,
     input_failed: u64,
+    last_input_expiry: Option<crate::desktop_actor::InputExpiry>,
 }
 impl From<ActorTimings> for ActorRecord {
     fn from(t: ActorTimings) -> Self {
@@ -149,6 +150,7 @@ impl From<ActorTimings> for ActorRecord {
             input_expired: t.input_expired,
             input_cancelled: t.input_cancelled,
             input_failed: t.input_failed,
+            last_input_expiry: t.last_input_expiry,
         }
     }
 }
@@ -1047,7 +1049,7 @@ mod tests {
         let mut expected = json!({
             "version":4,"session":3,"elapsed_ms":10,"terminal":false,"bitrate_kbps":700,"fps":8,"bwe_estimate_bps":900000,"allocation":null,"encoder_starts":0,"encoder_restarts":0,"keyframe_requests":0,"encoder_kbps":null,"encoder_fps":null,"frames":6,"input_ready":false,
             "input_received":0,"input_admitted":0,"input_denied":0,
-            "actor":{"capture_last_ms":0,"capture_timeout_sync":2,"capture_timeout_constraints":3,"capture_timeout_ready":5,"capture_timeout_consecutive":1,"capture_failed_last_ms":120,"conversion_last_ms":0,"comparison_last_ms":0,"input_queue_last_ms":0,"lock_query_last_ms":0,"lock_query_sequence":0,"lock_query_outcome":0,"lock_query_counts":[0,0,0,0,0,0,0,0],"lock_observed_us":0,"lock_query_us":0,"cancellations":0,"rejected_inputs":0,"input_completed":0,"input_expired":0,"input_cancelled":0,"input_failed":0},
+            "actor":{"capture_last_ms":0,"capture_timeout_sync":2,"capture_timeout_constraints":3,"capture_timeout_ready":5,"capture_timeout_consecutive":1,"capture_failed_last_ms":120,"conversion_last_ms":0,"comparison_last_ms":0,"input_queue_last_ms":0,"lock_query_last_ms":0,"lock_query_sequence":0,"lock_query_outcome":0,"lock_query_counts":[0,0,0,0,0,0,0,0],"lock_observed_us":0,"lock_query_us":0,"cancellations":0,"rejected_inputs":0,"input_completed":0,"input_expired":0,"input_cancelled":0,"input_failed":0,"last_input_expiry":null},
             "encoder":{"capture_to_submit_last_ms":15,"capture_to_selected_last_ms":10,"raw_write_last_ms":5,"raw_accepted":4,"raw_replaced":2,"raw_contended":1,"submit_to_output_last_ms":9,"capture_to_output_last_ms":24},
             "capture_to_writer_last_ms":null,"pacer_queue":{"sample_age_ms":4,"first_unsent_age_ms":80,"bytes":2048,"packets":3},"received_ack_frame_last_ms":120,"presented_frame_age_ms":130,"time_since_accepted_ack_ms":10,"rtc_tick_gap_max_ms":0,"due_timeout_lateness_max_ms":0,"fault":"encoder_framing","log_dropped":0,"log_failed":false
         });
@@ -1057,6 +1059,31 @@ mod tests {
             FaultReason::from_safe_reason("unknown private detail"),
             FaultReason::Operation
         ));
+    }
+    #[test]
+    fn expired_input_snapshot_records_only_kind_and_bounded_timing() {
+        use crate::desktop_actor::{InputExpiry, InputKind};
+
+        let mut snapshot = record(Instant::now());
+        snapshot.actor.last_input_expiry = Some(InputExpiry {
+            actor_session: 7,
+            kind: InputKind::Button,
+            queue_ms: 37,
+            native_ms: 483,
+            permit_remaining_at_dispatch_ms: 461,
+            permit_remaining_at_result_ms: -22,
+        });
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        assert!(bytes.len() < MAX_RECORD_BYTES);
+        let actual: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            actual["actor"]["last_input_expiry"],
+            json!({
+                "actor_session":7,"kind":"button","queue_ms":37,"native_ms":483,
+                "permit_remaining_at_dispatch_ms":461,
+                "permit_remaining_at_result_ms":-22
+            })
+        );
     }
     #[test]
     fn host_cleanup_failure_and_final_outcome_drain_before_writer_shutdown() {

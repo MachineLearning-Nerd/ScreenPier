@@ -345,6 +345,9 @@ mod tests {
         let smooth: OfferBody =
             serde_json::from_str(r#"{"sdp":"offer","quality":"smooth"}"#).unwrap();
         assert_eq!(smooth.quality, QualityMode::Smooth);
+        let focus: OfferBody =
+            serde_json::from_str(r#"{"sdp":"offer","quality":"focus"}"#).unwrap();
+        assert_eq!(focus.quality, QualityMode::Focus);
         assert!(
             serde_json::from_str::<OfferBody>(r#"{"sdp":"offer","quality":"unlimited"}"#).is_err()
         );

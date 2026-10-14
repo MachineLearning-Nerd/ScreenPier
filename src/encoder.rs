@@ -734,6 +734,7 @@ fn parse_boundary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{desktop::Viewport, session::ViewportFrame};
     use std::sync::mpsc::TryRecvError;
 
     fn encoded_frame(timestamp: u32) -> EncodedFrame {
@@ -745,6 +746,7 @@ mod tests {
                 generation: 7,
                 content: timestamp as u64,
                 captured: Instant::now(),
+                viewport: None,
             },
             ticks: timestamp as u64 * 3000,
         }
@@ -767,6 +769,7 @@ mod tests {
                 generation: 7,
                 content: timestamp as u64,
                 captured: Instant::now(),
+                viewport: None,
             },
             ticks: timestamp as u64 * 3000,
         }
@@ -808,11 +811,21 @@ mod tests {
         let encoder = test_encoder();
         assert_eq!(encoder.submit(raw_frame(1)), Ok(SubmitOutcome::Accepted));
         assert_eq!(encoder.submit(raw_frame(2)), Ok(SubmitOutcome::Replaced));
-        assert_eq!(encoder.submit(raw_frame(3)), Ok(SubmitOutcome::Replaced));
+        let mut newest = raw_frame(3);
+        newest.identity.viewport = Some(ViewportFrame {
+            seq: 2,
+            viewport: Viewport::new(640, 360, 1280, 720, 1920, 1080).unwrap(),
+        });
+        assert_eq!(encoder.submit(newest), Ok(SubmitOutcome::Replaced));
         let mut input = ScriptWriter::new([4]);
         let selected =
             completed(write_raw(&encoder.input, &mut None, &mut input, 4, Instant::now()).unwrap());
         assert_eq!(selected.identity.timestamp, 3);
+        assert_eq!(selected.identity.viewport.unwrap().seq, 2);
+        assert_eq!(
+            selected.identity.viewport.unwrap().viewport.origin(),
+            (640, 360)
+        );
         assert_eq!(selected.ticks, 9000);
         assert_eq!(input.bytes, [3, 3, 3, 3]);
         assert_eq!(encoder.input.accepted.load(Ordering::Relaxed), 1);
@@ -1138,6 +1151,7 @@ mod tests {
                 generation: 7,
                 content: timestamp as u64,
                 captured: Instant::now(),
+                viewport: None,
             };
             encoder
                 .submit(RawFrame {

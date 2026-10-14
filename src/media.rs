@@ -2,10 +2,11 @@ use crate::{
     allocation::{Allocation, AllocationController, BandwidthObservation, EstimateKind, fps_for},
     desktop::{
         AuthorityPhase, AuthoritySnapshot, Button, ClipboardGuard, DesktopGeometry, InputPermit,
-        KeyCode, KnownLock, LockKnowledge, LockState, Position, Transition,
+        KeyCode, KnownLock, LockKnowledge, LockState, Position, Transition, Viewport,
     },
     desktop_actor::{
-        ActorTimings, CleanupHealth, DesktopActor, DesktopSession, InputAction, ShutdownOutcome,
+        ActorTimings, CleanupHealth, DesktopActor, DesktopSession, InputAction, InputOutcome,
+        ShutdownOutcome,
     },
     diagnostics::{
         CleanupEvent, CleanupRecord, DiagnosticsLog, FaultReason, PeerDiagnostics, PeerSnapshot,
@@ -14,7 +15,8 @@ use crate::{
     encoder::{Encoder, EncoderFault, EncoderWorkers, RawFrame},
     server::{Config, HostStatus},
     session::{
-        Command, DEADMAN, DisplayProgress, FrameIdentity, MAX_MESSAGE, deadline_offset, micros,
+        Command, DEADMAN, DisplayProgress, FrameIdentity, MAX_MESSAGE, ViewportFrame,
+        deadline_offset, micros,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -27,7 +29,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::Receiver,
+        mpsc::{Receiver, TryRecvError},
     },
     time::{Duration, Instant},
 };
@@ -49,6 +51,7 @@ pub enum QualityMode {
     Clear,
     LowData,
     Smooth,
+    Focus,
 }
 
 impl QualityMode {
@@ -57,13 +60,16 @@ impl QualityMode {
             Self::Clear => 800,
             Self::LowData => 560,
             Self::Smooth => 2400,
+            Self::Focus => 400,
         };
         operator_cap.min(mode_cap)
     }
 
     fn capture_fps(self, operator_cap: u32) -> u32 {
         let cap = self.bitrate_cap(operator_cap);
-        if self == Self::Smooth && cap >= 1500 {
+        if self == Self::Focus {
+            8
+        } else if self == Self::Smooth && cap >= 1500 {
             20
         } else {
             fps_for(cap)
@@ -141,9 +147,216 @@ struct ControlState {
     lock: LockState,
 }
 
+const FOCUS_WIDTH: u32 = 1280;
+const FOCUS_HEIGHT: u32 = 720;
+const MAX_INPUT_ID: u64 = 9_007_199_254_740_991;
+const INPUT_RESULT_CAPACITY: usize = 256;
+const INPUT_REJECT_CAPACITY: usize = 64;
+
+enum InputResultState {
+    Pending(Receiver<InputOutcome>),
+    Done {
+        outcome: InputOutcome,
+        announced: bool,
+    },
+}
+struct InputResultEntry {
+    id: u64,
+    state: InputResultState,
+}
+#[derive(Default)]
+struct InputResults {
+    highest: u64,
+    entries: VecDeque<InputResultEntry>,
+    capacity_rejections: VecDeque<u64>,
+}
+enum InputStart {
+    New,
+    Pending,
+    Replay(InputOutcome),
+}
+impl InputResults {
+    fn settle_for_reset(&mut self) {
+        for entry in &mut self.entries {
+            if let InputResultState::Pending(receiver) = &entry.state {
+                let outcome = receiver.try_recv().unwrap_or(InputOutcome::Unknown);
+                entry.state = InputResultState::Done {
+                    outcome,
+                    announced: false,
+                };
+            }
+        }
+    }
+    fn has_unannounced(&self) -> bool {
+        self.entries.iter().any(|entry| match &entry.state {
+            InputResultState::Pending(_) => true,
+            InputResultState::Done { announced, .. } => !*announced,
+        })
+    }
+    fn begin(&mut self, id: u64) -> InputStart {
+        if id == 0 || id > MAX_INPUT_ID {
+            return InputStart::Replay(InputOutcome::Rejected);
+        }
+        if id <= self.highest {
+            if self.capacity_rejections.contains(&id) {
+                return InputStart::Replay(InputOutcome::Rejected);
+            }
+            return match self.entries.iter().find(|entry| entry.id == id) {
+                Some(InputResultEntry {
+                    state: InputResultState::Pending(_),
+                    ..
+                }) => InputStart::Pending,
+                Some(InputResultEntry {
+                    state:
+                        InputResultState::Done {
+                            announced: false, ..
+                        },
+                    ..
+                }) => InputStart::Pending,
+                Some(InputResultEntry {
+                    state:
+                        InputResultState::Done {
+                            outcome,
+                            announced: true,
+                        },
+                    ..
+                }) => InputStart::Replay(*outcome),
+                None => InputStart::Replay(InputOutcome::Unknown),
+            };
+        }
+        self.highest = id;
+        while self.entries.len() >= INPUT_RESULT_CAPACITY
+            && self.entries.front().is_some_and(|entry| {
+                matches!(
+                    entry.state,
+                    InputResultState::Done {
+                        announced: true,
+                        ..
+                    }
+                )
+            })
+        {
+            self.entries.pop_front();
+        }
+        if self.entries.len() >= INPUT_RESULT_CAPACITY {
+            self.capacity_rejections.push_back(id);
+            if self.capacity_rejections.len() > INPUT_REJECT_CAPACITY {
+                self.capacity_rejections.pop_front();
+            }
+            InputStart::Replay(InputOutcome::Rejected)
+        } else {
+            InputStart::New
+        }
+    }
+    fn pending(&mut self, id: u64, receiver: Receiver<InputOutcome>) {
+        self.entries.push_back(InputResultEntry {
+            id,
+            state: InputResultState::Pending(receiver),
+        });
+    }
+    fn done(&mut self, id: u64, outcome: InputOutcome) {
+        self.entries.push_back(InputResultEntry {
+            id,
+            state: InputResultState::Done {
+                outcome,
+                announced: false,
+            },
+        });
+    }
+    fn next(&mut self) -> Option<(u64, InputOutcome)> {
+        for entry in &mut self.entries {
+            let outcome = match &mut entry.state {
+                InputResultState::Pending(receiver) => match receiver.try_recv() {
+                    Ok(outcome) => Some(outcome),
+                    Err(TryRecvError::Disconnected) => Some(InputOutcome::Unknown),
+                    Err(TryRecvError::Empty) => None,
+                },
+                InputResultState::Done {
+                    outcome,
+                    announced: false,
+                } => Some(*outcome),
+                InputResultState::Done {
+                    announced: true, ..
+                } => None,
+            };
+            if let Some(outcome) = outcome {
+                entry.state = InputResultState::Done {
+                    outcome,
+                    announced: true,
+                };
+                return Some((entry.id, outcome));
+            }
+        }
+        None
+    }
+}
+
+struct FocusState {
+    frame: ViewportFrame,
+    previous: Option<Arc<[u8]>>,
+    content: u64,
+}
+
+impl FocusState {
+    fn centered(geometry: &DesktopGeometry, width: u32, height: u32) -> Result<Self> {
+        Ok(Self {
+            frame: ViewportFrame {
+                seq: 0,
+                viewport: Viewport::centered(geometry, width, height, FOCUS_WIDTH, FOCUS_HEIGHT)?,
+            },
+            previous: None,
+            content: 0,
+        })
+    }
+
+    fn capture(
+        &mut self,
+        geometry: &DesktopGeometry,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<(Arc<[u8]>, u64, ViewportFrame)> {
+        let validated = Viewport::centered(geometry, width, height, FOCUS_WIDTH, FOCUS_HEIGHT)?;
+        if self.frame.viewport.full_dimensions() != validated.full_dimensions() {
+            bail!("focus viewport no longer matches the captured output");
+        }
+        let cropped: Arc<[u8]> = self.frame.viewport.crop_rgba(pixels)?.into();
+        if self.previous.as_ref().is_none_or(|old| **old != *cropped) {
+            self.content = self.content.wrapping_add(1);
+        }
+        self.previous = Some(cropped.clone());
+        Ok((cropped, self.content, self.frame))
+    }
+
+    fn set_viewport(&mut self, frame: ViewportFrame) {
+        self.frame = frame;
+        self.previous = None;
+    }
+
+    fn proposed_pan(
+        &self,
+        geometry: &DesktopGeometry,
+        seq: u64,
+        x: u32,
+        y: u32,
+    ) -> Option<ViewportFrame> {
+        if seq <= self.frame.seq || geometry.scale != 1 || geometry.transform != 0 {
+            return None;
+        }
+        let (width, height) = self.frame.viewport.dimensions();
+        let (full_width, full_height) = self.frame.viewport.full_dimensions();
+        if (geometry.width, geometry.height) != (full_width, full_height) {
+            return None;
+        }
+        let viewport = Viewport::new(x, y, width, height, full_width, full_height).ok()?;
+        Some(ViewportFrame { seq, viewport })
+    }
+}
+
 struct OutboundMessage {
     bytes: Vec<u8>,
     clipboard: Option<(ClipboardGuard, Vec<u8>)>,
+    input_result: bool,
 }
 impl std::ops::Deref for OutboundMessage {
     type Target = [u8];
@@ -167,6 +380,10 @@ struct Peer {
     desktop: Option<DesktopSession>,
     actor: Option<DesktopActor>,
     geometry: Option<DesktopGeometry>,
+    quality: QualityMode,
+    focus: Option<FocusState>,
+    input_results: InputResults,
+    reset_notice: Option<String>,
     actor_timings: ActorTimings,
     encoder: Option<Encoder>,
     encoder_workers: EncoderWorkers,
@@ -220,6 +437,10 @@ impl Peer {
             desktop: None,
             actor: None,
             geometry: None,
+            quality: QualityMode::Clear,
+            focus: None,
+            input_results: InputResults::default(),
+            reset_notice: None,
             actor_timings: ActorTimings::default(),
             encoder: None,
             encoder_workers: EncoderWorkers::default(),
@@ -332,6 +553,7 @@ impl Peer {
         self.outbound.push_back(OutboundMessage {
             bytes,
             clipboard: None,
+            input_result: message.get("type") == Some(&json!("input_result")),
         });
         Ok(())
     }
@@ -354,6 +576,7 @@ impl Peer {
         self.outbound.push_back(OutboundMessage {
             bytes,
             clipboard: Some((reply.guard, denied)),
+            input_result: false,
         });
         Ok(())
     }
@@ -444,9 +667,30 @@ impl Peer {
         self.encoder = None;
         self.desktop = None;
         self.geometry = None;
+        self.focus = None;
         self.progress = None;
-        self.outbound.clear();
-        self.queue(json!({"type":"reset","reason":reason}))
+        self.outbound.retain(|message| message.input_result);
+        self.input_results.settle_for_reset();
+        self.reset_notice = Some(reason.to_owned());
+        self.advance_reset_notice()
+    }
+
+    fn advance_reset_notice(&mut self) -> Result<()> {
+        if self.reset_notice.is_none() {
+            return Ok(());
+        }
+        self.publish_input_results()?;
+        if !self.input_results.has_unannounced()
+            && !self
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::ChannelData(_)))
+            && self.outbound.len() < 64
+        {
+            let reason = self.reset_notice.take().unwrap();
+            self.queue(json!({"type":"reset","reason":reason}))?;
+        }
+        Ok(())
     }
 
     fn revoke_input(&mut self) {
@@ -506,7 +750,11 @@ impl Peer {
         if self.last_queued_control == Some(state) && now < self.next_status {
             return Ok(());
         }
-        self.queue(json!({"type":"state","ready":state.ready,"clipboard_ready":state.clipboard_ready,"generation":state.generation,"input_revision":state.revision.to_string(),"lock":state.lock,"bitrate_kbps":self.allocation.applied().allocation.kbps,"fps":self.allocation.applied().allocation.fps}))?;
+        let ack_rtp = self
+            .progress
+            .as_ref()
+            .and_then(DisplayProgress::acknowledged_rtp);
+        self.queue(json!({"type":"state","ready":state.ready,"clipboard_ready":state.clipboard_ready,"generation":state.generation,"input_revision":state.revision.to_string(),"lock":state.lock,"ack_rtp":ack_rtp,"bitrate_kbps":self.allocation.applied().allocation.kbps,"fps":self.allocation.applied().allocation.fps}))?;
         self.last_queued_control = Some(state);
         if now >= self.next_status {
             self.next_status = now + Duration::from_millis(500);
@@ -662,15 +910,36 @@ impl Peer {
                 self.generation,
             );
         }
-        if self.ready && !ready {
+        let revoked = self.ready && !ready;
+        if revoked {
             self.revoke_input();
         }
         self.ready = ready;
-        state
+        if revoked {
+            self.control_state(
+                now,
+                self.desktop
+                    .as_ref()
+                    .map(DesktopSession::authority_snapshot),
+            )
+        } else {
+            state
+        }
     }
 
     fn process_command(&mut self, command: Command, log: Option<&DiagnosticsLog>) -> Result<()> {
         if self.is_resetting() {
+            if self.authenticated_channel && self.reset_notice.is_some() {
+                if let Command::Key { id: Some(id), .. } | Command::Button { id: Some(id), .. } =
+                    command
+                {
+                    match self.input_results.begin(id) {
+                        InputStart::New => self.input_results.done(id, InputOutcome::Rejected),
+                        InputStart::Pending => {}
+                        InputStart::Replay(outcome) => self.queue_input_result(id, outcome)?,
+                    }
+                }
+            }
             return Ok(());
         }
         self.stage = "Desktop control";
@@ -729,10 +998,11 @@ impl Peer {
                 epoch,
                 generation,
                 rtp,
+                viewport_seq,
             } => {
                 if epoch == self.epoch {
                     if let Some(progress) = &mut self.progress {
-                        if progress.acknowledge(generation, rtp, now) {
+                        if progress.acknowledge_viewport(generation, rtp, viewport_seq, now) {
                             self.diagnostics.received_ack_frame_last_ms = progress
                                 .presented_age(now)
                                 .map(|age| age.as_millis() as u64);
@@ -740,6 +1010,13 @@ impl Peer {
                     }
                 }
             }
+            Command::Viewport {
+                revision,
+                generation,
+                seq,
+                x,
+                y,
+            } => self.pan_viewport(revision, generation, seq, x, y)?,
             Command::ClipboardRead { request } => {
                 let queued = self.control_availability(now).clipboard
                     && self
@@ -765,35 +1042,37 @@ impl Peer {
             Command::Pointer {
                 revision,
                 generation,
+                rtp,
                 x,
                 y,
             } => {
-                if let Some(permit) = self.admit_input_revision(generation, &revision, log) {
-                    self.queue_input(InputAction::Pointer(Position::new(x, y)?), permit)?;
+                if let Some(permit) = self.admit_input_revision(generation, rtp, &revision, log) {
+                    self.queue_input(InputAction::Pointer(self.input_position(x, y)?), permit)?;
                 }
             }
             Command::Key {
+                id,
                 revision,
                 generation,
+                rtp,
                 code,
                 down,
             } => {
-                if let Some(permit) = self.admit_input_revision(generation, &revision, log) {
-                    self.queue_input(
-                        InputAction::Key(KeyCode::new(code)?, transition(down)),
-                        permit,
-                    )?;
-                }
+                self.transition_input(id, generation, rtp, &revision, log, |_| {
+                    Ok(InputAction::Key(KeyCode::new(code)?, transition(down)))
+                })?;
             }
             Command::Button {
+                id,
                 revision,
                 generation,
+                rtp,
                 x,
                 y,
                 button,
                 down,
             } => {
-                if let Some(permit) = self.admit_input_revision(generation, &revision, log) {
+                self.transition_input(id, generation, rtp, &revision, log, |peer| {
                     let button = match button {
                         0 => Button::Left,
                         1 => Button::Middle,
@@ -802,26 +1081,97 @@ impl Peer {
                         4 => Button::Forward,
                         _ => bail!("unsupported button"),
                     };
-                    self.queue_input(
-                        InputAction::Button(Position::new(x, y)?, button, transition(down)),
-                        permit,
-                    )?;
-                }
+                    Ok(InputAction::Button(
+                        peer.input_position(x, y)?,
+                        button,
+                        transition(down),
+                    ))
+                })?;
             }
             Command::Scroll {
                 revision,
                 generation,
+                rtp,
                 x,
                 y,
                 dx,
                 dy,
             } => {
-                if let Some(permit) = self.admit_input_revision(generation, &revision, log) {
-                    self.queue_input(InputAction::Axis(Position::new(x, y)?, dx, dy), permit)?;
+                if let Some(permit) = self.admit_input_revision(generation, rtp, &revision, log) {
+                    self.queue_input(
+                        InputAction::Axis(self.input_position(x, y)?, dx, dy),
+                        permit,
+                    )?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn process_reset_channel_data(
+        &mut self,
+        data: &[u8],
+        log: Option<&DiagnosticsLog>,
+    ) -> Result<()> {
+        if let Ok(command) = serde_json::from_slice::<Command>(data) {
+            self.process_command(command, log)?;
+        }
+        Ok(())
+    }
+
+    fn pan_viewport(
+        &mut self,
+        revision: String,
+        generation: u64,
+        seq: u64,
+        x: u32,
+        y: u32,
+    ) -> Result<()> {
+        if self.quality != QualityMode::Focus {
+            return Ok(());
+        }
+        let proposed = (|| {
+            let desktop = self.desktop.as_ref()?;
+            let geometry = self.geometry.as_ref()?;
+            let focus = self.focus.as_ref()?;
+            if !desktop.input_open()
+                || revision != desktop.revision().to_string()
+                || generation != self.generation
+                || generation != geometry.generation
+            {
+                return None;
+            }
+            focus.proposed_pan(geometry, seq, x, y)
+        })();
+        let Some(frame) = proposed else {
+            self.queue(json!({"type":"viewport_rejected","seq":seq}))?;
+            return Ok(());
+        };
+        self.apply_viewport(frame);
+        Ok(())
+    }
+
+    fn apply_viewport(&mut self, frame: ViewportFrame) {
+        self.revoke_input();
+        self.focus.as_mut().unwrap().set_viewport(frame);
+        self.progress = None;
+        self.encoder = None;
+        self.reset_encoder = false;
+        self.last_queued_control = None;
+    }
+
+    fn input_position(&self, x: f64, y: f64) -> Result<Position> {
+        let position = Position::new(x, y)?;
+        if self.quality != QualityMode::Focus {
+            return Ok(position);
+        }
+        let frame = self
+            .progress
+            .as_ref()
+            .and_then(DisplayProgress::acknowledged_frame)
+            .and_then(|frame| frame.viewport)
+            .context("focus input requires a displayed viewport frame")?;
+        Ok(frame.viewport.map_position(position)?)
     }
 
     fn queue_input(&self, action: InputAction, permit: InputPermit) -> Result<()> {
@@ -835,9 +1185,63 @@ impl Peer {
         }
     }
 
+    fn transition_input(
+        &mut self,
+        id: Option<u64>,
+        generation: u64,
+        rtp: Option<u32>,
+        revision: &str,
+        log: Option<&DiagnosticsLog>,
+        action: impl FnOnce(&Self) -> Result<InputAction>,
+    ) -> Result<()> {
+        if let Some(id) = id {
+            match self.input_results.begin(id) {
+                InputStart::Pending => return Ok(()),
+                InputStart::Replay(outcome) => return self.queue_input_result(id, outcome),
+                InputStart::New => {}
+            }
+            let permit = self.admit_input_revision(generation, rtp, revision, log);
+            let action = permit.as_ref().and_then(|_| action(self).ok());
+            match (permit, action) {
+                (Some(permit), Some(action)) => {
+                    match self.desktop.as_ref().unwrap().input_tracked(action, permit) {
+                        Ok(receiver) => self.input_results.pending(id, receiver),
+                        Err(_) => self.input_results.done(id, InputOutcome::Rejected),
+                    }
+                }
+                _ => self.input_results.done(id, InputOutcome::Rejected),
+            }
+            Ok(())
+        } else if let Some(permit) = self.admit_input_revision(generation, rtp, revision, log) {
+            self.queue_input(action(self)?, permit)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn queue_input_result(&mut self, id: u64, outcome: InputOutcome) -> Result<()> {
+        self.queue(json!({"type":"input_result","id":id,"status":outcome}))
+    }
+
+    fn publish_input_results(&mut self) -> Result<bool> {
+        let mut queued = false;
+        for _ in 0..16 {
+            if self.outbound.len() >= 48 {
+                break;
+            }
+            let Some((id, outcome)) = self.input_results.next() else {
+                break;
+            };
+            self.queue_input_result(id, outcome)?;
+            queued = true;
+        }
+        Ok(queued)
+    }
+
     fn admit_input_revision(
         &mut self,
         generation: u64,
+        rtp: Option<u32>,
         revision: &str,
         log: Option<&DiagnosticsLog>,
     ) -> Option<InputPermit> {
@@ -846,9 +1250,17 @@ impl Peer {
         }) {
             self.diagnostics.input_received = self.diagnostics.input_received.saturating_add(1);
             self.diagnostics.input_denied = self.diagnostics.input_denied.saturating_add(1);
+            self.record_readiness(
+                log,
+                Instant::now(),
+                ReadinessEvent::AdmissionDenied,
+                ReadinessReason::Unresolved,
+                false,
+                generation,
+            );
             return None;
         }
-        self.admit_input(generation, log).map(|permit| {
+        self.admit_input(generation, rtp, log).map(|permit| {
             self.desktop
                 .as_ref()
                 .unwrap()
@@ -859,6 +1271,7 @@ impl Peer {
     fn admit_input(
         &mut self,
         generation: u64,
+        rtp: Option<u32>,
         log: Option<&DiagnosticsLog>,
     ) -> Option<InputPermit> {
         self.diagnostics.input_received = self.diagnostics.input_received.saturating_add(1);
@@ -869,7 +1282,24 @@ impl Peer {
         {
             self.progress
                 .as_ref()
-                .and_then(|progress| progress.input_permit(generation, self.heartbeat, now))
+                .and_then(|progress| match rtp {
+                    Some(rtp) => {
+                        progress.input_permit_for_frame(generation, rtp, self.heartbeat, now)
+                    }
+                    None if self.quality != QualityMode::Focus => {
+                        progress.input_permit(generation, self.heartbeat, now)
+                    }
+                    None => None,
+                })
+                .filter(|_| {
+                    self.quality != QualityMode::Focus
+                        || self.focus.as_ref().is_some_and(|focus| {
+                            self.progress
+                                .as_ref()
+                                .and_then(DisplayProgress::acknowledged_frame)
+                                .is_some_and(|frame| frame.viewport == Some(focus.frame))
+                        })
+                })
         } else {
             None
         };
@@ -920,8 +1350,17 @@ impl Peer {
                 break;
             };
             if self.is_resetting() {
-                if matches!(event, Event::ChannelClose(_) | Event::Closed) {
-                    bail!("peer closed");
+                match event {
+                    Event::ChannelClose(_) | Event::Closed => bail!("peer closed"),
+                    Event::ChannelData(data)
+                        if self.reset_notice.is_some()
+                            && Some(data.id) == self.channel
+                            && !data.binary
+                            && data.data.len() <= MAX_MESSAGE =>
+                    {
+                        self.process_reset_channel_data(&data.data, log)?;
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -967,6 +1406,7 @@ impl Peer {
                 _ => {}
             }
         }
+        self.advance_reset_notice()?;
         self.flush_messages(socket)
     }
 
@@ -1100,39 +1540,68 @@ impl Peer {
             }
             self.generation = frame.geometry.generation;
             self.geometry = Some(frame.geometry.clone());
-            self.content = frame.content;
-            let pixels = frame.pixels;
+            let (pixels, content, viewport, width, height) = if self.quality == QualityMode::Focus {
+                let focus = match self.focus.as_mut() {
+                    Some(focus) => focus,
+                    None => self.focus.insert(FocusState::centered(
+                        &frame.geometry,
+                        frame.width,
+                        frame.height,
+                    )?),
+                };
+                let (pixels, content, viewport) =
+                    focus.capture(&frame.geometry, frame.width, frame.height, &frame.pixels)?;
+                let (width, height) = viewport.viewport.dimensions();
+                (pixels, content, Some(viewport), width, height)
+            } else {
+                (frame.pixels, frame.content, None, frame.width, frame.height)
+            };
+            self.content = content;
             let captured = frame.captured;
             let progress = self
                 .progress
                 .get_or_insert_with(|| DisplayProgress::new(self.generation, captured));
-            progress.captured(self.content, captured);
+            progress.captured(content, captured);
             if self.reset_encoder {
                 self.encoder = None;
                 self.reset_encoder = false;
             }
+            let mut submit = true;
             if self.encoder.is_none() {
                 self.stage = "H.264 encoder startup";
-                self.start_encoder(config, frame.width, frame.height)?;
-                self.desktop
-                    .as_ref()
-                    .unwrap()
-                    .set_fps(self.allocation.applied().allocation.fps);
+                match self.start_encoder(config, width, height) {
+                    Ok(()) => self
+                        .desktop
+                        .as_ref()
+                        .unwrap()
+                        .set_fps(self.allocation.applied().allocation.fps),
+                    Err(error)
+                        if self.quality == QualityMode::Focus
+                            && error.downcast_ref::<EncoderFault>()
+                                == Some(&EncoderFault::WorkerLimit) =>
+                    {
+                        submit = false;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            let ticks =
-                (captured.duration_since(self.started).as_nanos() * 90_000 / 1_000_000_000) as u64;
-            let identity = FrameIdentity {
-                timestamp: ticks as u32,
-                generation: self.generation,
-                content: self.content,
-                captured,
-            };
-            self.stage = "H.264 encoder";
-            self.encoder.as_ref().unwrap().submit(RawFrame {
-                pixels,
-                identity,
-                ticks,
-            })?;
+            if submit {
+                let ticks = (captured.duration_since(self.started).as_nanos() * 90_000
+                    / 1_000_000_000) as u64;
+                let identity = FrameIdentity {
+                    timestamp: ticks as u32,
+                    generation: self.generation,
+                    content,
+                    captured,
+                    viewport,
+                };
+                self.stage = "H.264 encoder";
+                self.encoder.as_ref().unwrap().submit(RawFrame {
+                    pixels,
+                    identity,
+                    ticks,
+                })?;
+            }
         }
         for _ in 0..2 {
             self.stage = "H.264 video transport";
@@ -1143,6 +1612,11 @@ impl Peer {
             let Some(frame) = encoded else {
                 break;
             };
+            if self.quality == QualityMode::Focus
+                && self.focus.as_ref().map(|focus| focus.frame) != frame.identity.viewport
+            {
+                continue;
+            }
             self.diagnostics.encoding = Some(frame.timings);
             self.diagnostics.capture_to_writer_last_ms = Some(
                 Instant::now()
@@ -1169,8 +1643,25 @@ impl Peer {
             self.drain(socket)?;
             self.progress.as_mut().unwrap().sent(frame.identity);
             self.frames += 1;
-            let geometry = self.geometry.as_ref().context("geometry unavailable")?;
-            self.queue(json!({"type":"frame","epoch":self.epoch,"generation":self.generation,"rtp":frame.identity.timestamp,"width":geometry.width,"height":geometry.height}))?;
+            let (width, height) = frame
+                .identity
+                .viewport
+                .map_or_else(
+                    || {
+                        self.geometry
+                            .as_ref()
+                            .map(|geometry| (geometry.width, geometry.height))
+                    },
+                    |frame| Some(frame.viewport.dimensions()),
+                )
+                .context("geometry unavailable")?;
+            let mut annotation = json!({"type":"frame","epoch":self.epoch,"generation":self.generation,"rtp":frame.identity.timestamp,"width":width,"height":height});
+            if let Some(viewport) = frame.identity.viewport {
+                let (x, y) = viewport.viewport.origin();
+                let (full_width, full_height) = viewport.viewport.full_dimensions();
+                annotation["viewport"] = json!({"seq":viewport.seq,"x":x,"y":y,"width":width,"height":height,"full_width":full_width,"full_height":full_height});
+            }
+            self.queue(annotation)?;
         }
         self.stage = "H.264 encoder";
         if let Some(fault) = self.encoder.as_ref().and_then(Encoder::fault) {
@@ -1212,6 +1703,9 @@ impl Peer {
             self.drain(socket)?;
         }
         self.events(config, socket, log)?;
+        if self.publish_input_results()? {
+            self.flush_messages(socket)?;
+        }
         if let PeerPhase::Resetting { deadline } = self.phase {
             if Instant::now() >= deadline {
                 bail!("reset drain expired");
@@ -1344,6 +1838,7 @@ pub fn run_host(
                     let result = Peer::new(sdp, &session_config, local, Some(&socket), rate_mode);
                     match result {
                         Ok((mut new_peer, sdp)) => {
+                            new_peer.quality = quality;
                             session_ordinal = session_ordinal.saturating_add(1);
                             new_peer.diagnostics.session = session_ordinal;
                             new_peer.actor = Some(actor.clone());
@@ -1629,16 +2124,122 @@ mod tests {
         assert_eq!(QualityMode::Clear.bitrate_cap(3000), 800);
         assert_eq!(QualityMode::LowData.bitrate_cap(3000), 560);
         assert_eq!(QualityMode::Smooth.bitrate_cap(3000), 2400);
+        assert_eq!(QualityMode::Focus.bitrate_cap(3000), 400);
         assert_eq!(QualityMode::Clear.capture_fps(3000), 15);
         assert_eq!(QualityMode::LowData.capture_fps(3000), 8);
         assert_eq!(QualityMode::Smooth.capture_fps(3000), 20);
+        assert_eq!(QualityMode::Focus.capture_fps(3000), 8);
         for mode in [
             QualityMode::Clear,
             QualityMode::LowData,
             QualityMode::Smooth,
+            QualityMode::Focus,
         ] {
             assert_eq!(mode.bitrate_cap(400), 400);
         }
+    }
+
+    fn focus_geometry() -> DesktopGeometry {
+        DesktopGeometry {
+            output: "eDP-1".into(),
+            width: 1920,
+            height: 1080,
+            scale: 1,
+            transform: 0,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn focus_crops_native_pixels_and_ignores_content_changes_outside_the_view() {
+        let geometry = focus_geometry();
+        let mut focus = FocusState::centered(&geometry, 1920, 1080).unwrap();
+        assert_eq!(focus.frame.seq, 0);
+        assert_eq!(focus.frame.viewport.origin(), (320, 180));
+        let mut full = vec![0; 1920 * 1080 * 4];
+        let (first, revision, _) = focus.capture(&geometry, 1920, 1080, &full).unwrap();
+        assert_eq!(first.len(), 1280 * 720 * 4);
+        assert_eq!(revision, 1);
+        full[0] = 40;
+        let (outside, revision, _) = focus.capture(&geometry, 1920, 1080, &full).unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(outside[0], 0);
+        full[(180 * 1920 + 320) * 4] = 90;
+        let (inside, revision, _) = focus.capture(&geometry, 1920, 1080, &full).unwrap();
+        assert_eq!(revision, 2);
+        assert_eq!(inside[0], 90);
+    }
+
+    #[test]
+    fn focus_rejects_unsupported_geometry_and_out_of_bounds_pan() {
+        let mut geometry = focus_geometry();
+        let focus = FocusState::centered(&geometry, 1920, 1080).unwrap();
+        assert!(focus.proposed_pan(&geometry, 0, 0, 0).is_none());
+        assert!(focus.proposed_pan(&geometry, 1, 641, 0).is_none());
+        assert_eq!(
+            focus
+                .proposed_pan(&geometry, 1, 0, 360)
+                .unwrap()
+                .viewport
+                .origin(),
+            (0, 360)
+        );
+        geometry.scale = 2;
+        assert!(FocusState::centered(&geometry, 1920, 1080).is_err());
+        assert!(focus.proposed_pan(&geometry, 1, 0, 0).is_none());
+        geometry.scale = 1;
+        geometry.transform = 1;
+        assert!(FocusState::centered(&geometry, 1920, 1080).is_err());
+        geometry.transform = 0;
+        assert!(FocusState::centered(&geometry, 1919, 1080).is_err());
+    }
+
+    #[test]
+    fn focus_pan_blocks_old_input_until_a_new_viewport_frame_is_acknowledged() {
+        let now = Instant::now();
+        let geometry = focus_geometry();
+        let mut peer = fresh_peer(now);
+        peer.quality = QualityMode::Focus;
+        peer.focus = Some(FocusState::centered(&geometry, 1920, 1080).unwrap());
+        peer.geometry = Some(geometry.clone());
+        let pan = peer
+            .focus
+            .as_ref()
+            .unwrap()
+            .proposed_pan(&geometry, 1, 0, 0)
+            .unwrap();
+        peer.ready = true;
+        peer.apply_viewport(pan);
+        assert!(!peer.ready);
+        assert!(peer.progress.is_none());
+        assert_eq!(peer.focus.as_ref().unwrap().frame, pan);
+        assert!(peer.admit_input(1, Some(42), None).is_none());
+
+        let mut progress = DisplayProgress::new(1, now);
+        progress.captured(1, now);
+        progress.sent(FrameIdentity {
+            timestamp: 42,
+            generation: 1,
+            content: 1,
+            captured: now,
+            viewport: Some(pan),
+        });
+        assert!(!progress.acknowledge_viewport(1, 42, Some(0), now));
+        assert!(!progress.acknowledge_viewport(1, 42, None, now));
+        peer.progress = Some(progress);
+        assert!(peer.admit_input(1, Some(42), None).is_none());
+        assert!(
+            peer.progress
+                .as_mut()
+                .unwrap()
+                .acknowledge_viewport(1, 42, Some(1), now)
+        );
+        assert!(peer.admit_input(1, None, None).is_none());
+        assert!(peer.admit_input(1, Some(42), None).is_some());
+        assert_eq!(
+            format!("{:?}", peer.input_position(1.0, 1.0).unwrap()),
+            "Position { x: 0.6664929650859823, y: 0.6663577386468953 }"
+        );
     }
 
     #[test]
@@ -1723,7 +2324,7 @@ mod tests {
             state_messages(&peer),
             vec![json!({
                 "type":"state", "ready":true, "clipboard_ready":true,
-                "generation":1, "input_revision":"0", "lock":"unlocked",
+                "generation":1, "input_revision":"0", "lock":"unlocked", "ack_rtp":42,
                 "bitrate_kbps":3000, "fps":30
             })]
         );
@@ -1741,7 +2342,7 @@ mod tests {
             vec![
                 json!({"type":"input_reset","revision":"1"}),
                 json!({"type":"state","ready":false,"clipboard_ready":true,
-                "generation":1,"input_revision":"1","lock":"unlocked",
+                "generation":1,"input_revision":"1","lock":"unlocked","ack_rtp":42,
                 "bitrate_kbps":3000,"fps":30})
             ]
         );
@@ -1754,6 +2355,7 @@ mod tests {
             generation: 1,
             content: 2,
             captured: presented,
+            viewport: None,
         });
         assert!(
             peer.progress
@@ -1768,7 +2370,7 @@ mod tests {
             state_messages(&peer),
             vec![json!({
                 "type":"state","ready":true,"clipboard_ready":true,
-                "generation":1,"input_revision":"1","lock":"unlocked",
+                "generation":1,"input_revision":"1","lock":"unlocked","ack_rtp":43,
                 "bitrate_kbps":3000,"fps":30
             })]
         );
@@ -1795,7 +2397,7 @@ mod tests {
             state_messages(&peer),
             vec![json!({
                 "type":"state","ready":true,"clipboard_ready":true,
-                "generation":1,"input_revision":"1","lock":"unlocked",
+                "generation":1,"input_revision":"1","lock":"unlocked","ack_rtp":42,
                 "bitrate_kbps":3000,"fps":30
             })]
         );
@@ -1920,7 +2522,7 @@ mod tests {
             state_messages(&peer),
             vec![json!({
                 "type":"state","ready":true,"clipboard_ready":true,
-                "generation":1,"input_revision":"0","lock":"unlocked",
+                "generation":1,"input_revision":"0","lock":"unlocked","ack_rtp":42,
                 "bitrate_kbps":700,"fps":8
             })]
         );
@@ -2204,6 +2806,7 @@ mod tests {
             generation: 7,
             content: 2,
             captured: Instant::now(),
+            viewport: None,
         };
         encoder
             .submit(RawFrame {
@@ -2291,22 +2894,75 @@ mod tests {
             generation: 1,
             content: 1,
             captured: now,
+            viewport: None,
         });
         assert!(progress.acknowledge(1, 42, now));
         peer.progress = Some(progress);
         peer.generation = 1;
         peer.heartbeat = now;
         peer.lock = LockState::Unlocked;
-        assert!(peer.admit_input(1, None).is_none());
+        assert!(peer.admit_input(1, Some(42), None).is_none());
         peer.authenticated_channel = true;
-        assert!(peer.admit_input(1, None).is_some());
-        assert!(peer.admit_input(2, None).is_none());
+        assert!(peer.admit_input(1, Some(43), None).is_none());
+        assert!(peer.admit_input(1, Some(42), None).is_some());
+        assert!(peer.admit_input(1, None, None).is_some());
+        assert!(peer.admit_input(2, Some(42), None).is_none());
         peer.lock = LockState::Unknown;
-        assert!(peer.admit_input(1, None).is_none());
+        assert!(peer.admit_input(1, Some(42), None).is_none());
         peer.lock = LockState::Locked;
-        assert!(peer.admit_input(1, None).is_some());
+        assert!(peer.admit_input(1, Some(42), None).is_some());
         peer.heartbeat = now - DEADMAN;
-        assert!(peer.admit_input(1, None).is_none());
+        assert!(peer.admit_input(1, Some(42), None).is_none());
+    }
+
+    #[test]
+    fn old_key_command_uses_the_original_display_permit_and_new_key_checks_its_frame() {
+        let now = Instant::now();
+        let mut peer = fresh_peer(now);
+        let legacy: Command = serde_json::from_str(
+            r#"{"type":"key","revision":"0","generation":1,"code":30,"down":true}"#,
+        )
+        .unwrap();
+        let frame_linked: Command = serde_json::from_str(
+            r#"{"type":"key","revision":"0","generation":1,"rtp":43,"code":30,"down":true}"#,
+        )
+        .unwrap();
+        let Command::Key { rtp: old_rtp, .. } = legacy else {
+            panic!("key command required");
+        };
+        let Command::Key { rtp: new_rtp, .. } = frame_linked else {
+            panic!("key command required");
+        };
+        assert!(peer.admit_input(1, old_rtp, None).is_some());
+        assert!(peer.admit_input(1, new_rtp, None).is_none());
+    }
+
+    #[test]
+    fn frame_linked_input_permit_cannot_cross_an_input_reset_revision() {
+        let now = Instant::now();
+        let peer = fresh_peer(now);
+        let authority = known_authority();
+        let old = peer
+            .progress
+            .as_ref()
+            .unwrap()
+            .input_permit_for_frame(1, 42, now, now)
+            .unwrap()
+            .authorized_by_revision(&authority, 0);
+        assert!(old.current_for(&authority));
+        authority.revoke();
+        assert_eq!(authority.released(), Some(1));
+        assert!(!old.current_for(&authority));
+        assert!(authority.acknowledge(1));
+        assert!(!old.current_for(&authority));
+        let new = peer
+            .progress
+            .as_ref()
+            .unwrap()
+            .input_permit_for_frame(1, 42, now, now)
+            .unwrap()
+            .authorized_by_revision(&authority, 1);
+        assert!(new.current_for(&authority));
     }
 
     fn fresh_peer(now: Instant) -> Peer {
@@ -2318,6 +2974,7 @@ mod tests {
             generation: 1,
             content: 1,
             captured: now,
+            viewport: None,
         });
         assert!(progress.acknowledge(1, 42, now));
         peer.progress = Some(progress);
@@ -2326,6 +2983,181 @@ mod tests {
         peer.heartbeat = now;
         peer.lock = LockState::Unlocked;
         peer
+    }
+    #[test]
+    fn tracked_input_denial_has_a_terminal_result_and_a_duplicate_cannot_resubmit() {
+        let now = Instant::now();
+        let mut peer = fresh_peer(now);
+        let command = || {
+            serde_json::from_str::<Command>(
+            r#"{"type":"key","id":7,"revision":"0","generation":1,"rtp":42,"code":30,"down":true}"#,
+        ).unwrap()
+        };
+        peer.process_command(command(), None).unwrap();
+        peer.process_command(command(), None).unwrap();
+        assert!(peer.outbound.is_empty());
+        assert!(peer.publish_input_results().unwrap());
+        assert_eq!(
+            state_messages(&peer),
+            vec![json!({"type":"input_result","id":7,"status":"rejected"})]
+        );
+        peer.outbound.clear();
+        peer.process_command(command(), None).unwrap();
+        assert_eq!(
+            state_messages(&peer),
+            vec![json!({"type":"input_result","id":7,"status":"rejected"})]
+        );
+        assert_eq!(peer.input_results.entries.len(), 1);
+    }
+
+    #[test]
+    fn input_ids_are_bounded_and_evicted_ids_never_execute_again() {
+        let mut results = InputResults::default();
+        for id in 1..=INPUT_RESULT_CAPACITY as u64 {
+            assert!(matches!(results.begin(id), InputStart::New));
+            results.done(id, InputOutcome::Applied);
+            assert_eq!(results.next(), Some((id, InputOutcome::Applied)));
+        }
+        assert!(matches!(results.begin(257), InputStart::New));
+        results.done(257, InputOutcome::Aborted);
+        assert_eq!(results.next(), Some((257, InputOutcome::Aborted)));
+        assert!(matches!(
+            results.begin(1),
+            InputStart::Replay(InputOutcome::Unknown)
+        ));
+        assert!(matches!(
+            results.begin(257),
+            InputStart::Replay(InputOutcome::Aborted)
+        ));
+        assert!(matches!(
+            results.begin(0),
+            InputStart::Replay(InputOutcome::Rejected)
+        ));
+        assert!(matches!(
+            results.begin(MAX_INPUT_ID + 1),
+            InputStart::Replay(InputOutcome::Rejected)
+        ));
+    }
+    #[test]
+    fn capacity_rejection_replays_after_a_pending_slot_frees() {
+        let mut results = InputResults::default();
+        let mut senders = Vec::new();
+        for id in 1..=INPUT_RESULT_CAPACITY as u64 {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            assert!(matches!(results.begin(id), InputStart::New));
+            results.pending(id, receiver);
+            senders.push(sender);
+        }
+        assert!(matches!(
+            results.begin(257),
+            InputStart::Replay(InputOutcome::Rejected)
+        ));
+        assert!(matches!(
+            results.begin(257),
+            InputStart::Replay(InputOutcome::Rejected)
+        ));
+        senders[0].send(InputOutcome::Applied).unwrap();
+        assert_eq!(results.next(), Some((1, InputOutcome::Applied)));
+        assert!(matches!(results.begin(258), InputStart::New));
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        results.pending(258, receiver);
+        assert!(matches!(
+            results.begin(257),
+            InputStart::Replay(InputOutcome::Rejected)
+        ));
+        assert_eq!(results.entries.len(), INPUT_RESULT_CAPACITY);
+    }
+    #[test]
+    fn pending_input_id_retries_wait_for_the_same_actor_outcome() {
+        let mut results = InputResults::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        assert!(matches!(results.begin(9), InputStart::New));
+        results.pending(9, receiver);
+        assert!(matches!(results.begin(9), InputStart::Pending));
+        assert_eq!(results.next(), None);
+        sender.send(InputOutcome::Applied).unwrap();
+        assert_eq!(results.next(), Some((9, InputOutcome::Applied)));
+        assert_eq!(results.next(), None);
+        assert!(matches!(
+            results.begin(9),
+            InputStart::Replay(InputOutcome::Applied)
+        ));
+    }
+
+    #[test]
+    fn same_peer_reset_preserves_queued_input_results() {
+        let now = Instant::now();
+        let mut peer = fresh_peer(now);
+        peer.queue_input_result(7, InputOutcome::Aborted).unwrap();
+        peer.queue(json!({"type":"state","ready":true})).unwrap();
+        peer.begin_reset("Desktop lock state changed", LockState::Locked, now, None)
+            .unwrap();
+        assert_eq!(
+            state_messages(&peer),
+            vec![
+                json!({"type":"input_result","id":7,"status":"aborted"}),
+                json!({"type":"reset","reason":"Desktop lock state changed"}),
+            ]
+        );
+    }
+    #[test]
+    fn reset_rejects_tracked_key_and_button_data_on_the_live_channel() {
+        let now = Instant::now();
+        let mut peer = fresh_peer(now);
+        peer.phase = PeerPhase::Resetting {
+            deadline: now + RESET_DRAIN,
+        };
+        peer.reset_notice = Some("Desktop lock state changed".into());
+        let key = br#"{"type":"key","id":11,"revision":"0","generation":1,"rtp":42,"code":30,"down":true}"#;
+        let button = br#"{"type":"button","id":12,"revision":"0","generation":1,"rtp":42,"x":0.5,"y":0.5,"button":0,"down":false}"#;
+        peer.process_reset_channel_data(key, None).unwrap();
+        peer.process_reset_channel_data(key, None).unwrap();
+        peer.process_reset_channel_data(button, None).unwrap();
+        peer.advance_reset_notice().unwrap();
+        assert_eq!(
+            state_messages(&peer),
+            vec![
+                json!({"type":"input_result","id":11,"status":"rejected"}),
+                json!({"type":"input_result","id":12,"status":"rejected"}),
+                json!({"type":"reset","reason":"Desktop lock state changed"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_sends_terminal_actor_receipt_before_browser_closing_notice() {
+        let now = Instant::now();
+        let mut peer = fresh_peer(now);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        assert!(matches!(peer.input_results.begin(5), InputStart::New));
+        peer.input_results.pending(5, receiver);
+        sender.send(InputOutcome::Aborted).unwrap();
+        peer.begin_reset("Desktop lock state changed", LockState::Locked, now, None)
+            .unwrap();
+        assert_eq!(
+            state_messages(&peer),
+            vec![
+                json!({"type":"input_result","id":5,"status":"aborted"}),
+                json!({"type":"reset","reason":"Desktop lock state changed"}),
+            ]
+        );
+    }
+    #[test]
+    fn reset_reports_unfinished_native_attempt_unknown_before_notice() {
+        let now = Instant::now();
+        let mut peer = fresh_peer(now);
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        assert!(matches!(peer.input_results.begin(6), InputStart::New));
+        peer.input_results.pending(6, receiver);
+        peer.begin_reset("Monitor geometry changed", LockState::Unlocked, now, None)
+            .unwrap();
+        assert_eq!(
+            state_messages(&peer),
+            vec![
+                json!({"type":"input_result","id":6,"status":"unknown"}),
+                json!({"type":"reset","reason":"Monitor geometry changed"}),
+            ]
+        );
     }
     #[test]
     fn clipboard_capability_requires_fresh_unlocked_display_but_not_native_input_authority() {
@@ -2471,7 +3303,7 @@ mod tests {
         let message: serde_json::Value = serde_json::from_slice(&peer.outbound[0]).unwrap();
         assert_eq!(message["type"], "reset");
         assert_eq!(message["reason"], "Desktop lock state changed");
-        assert!(peer.admit_input(1, None).is_none());
+        assert!(peer.admit_input(1, Some(42), None).is_none());
     }
 
     #[test]
@@ -2502,6 +3334,7 @@ mod tests {
             Command::Pointer {
                 revision: "0".into(),
                 generation: 1,
+                rtp: Some(42),
                 x: 0.5,
                 y: 0.5,
             },
