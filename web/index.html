@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TailWindowAccess</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10141c;color:#e7edf7}*{box-sizing:border-box}body{margin:0;display:flex;flex-direction:column;height:100dvh}header{padding:12px 18px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#192131;border-bottom:1px solid #33415a}h1{font-size:16px;margin:0 12px 0 0}button,select{background:#29374e;color:#edf3ff;border:1px solid #526784;border-radius:7px;padding:8px 12px;font:inherit}button{cursor:pointer}button:hover{background:#3b5274}button:disabled{opacity:.45;cursor:default}#connect{background:#225779}#status{font-size:14px;margin-left:auto;color:#acbdd8}#details{font-size:12px;color:#99aac3;padding:7px 18px;background:#151c28;display:flex;gap:20px;flex-wrap:wrap}label{cursor:pointer}main{flex:1;min-height:0;position:relative;background:#070a10;display:flex;align-items:center;justify-content:center;overflow:hidden}video{width:100%;height:100%;object-fit:contain;outline:none;touch-action:none}video:focus{box-shadow:inset 0 0 0 2px #558bcb}#placeholder{position:absolute;text-align:center;padding:24px;pointer-events:none;max-width:540px;color:#b1c1d8}#placeholder strong{display:block;font-size:23px;margin-bottom:12px}#notice{padding:10px 18px;min-height:39px;color:#bacbe5;background:#192131;font-size:13px}#notice.error{color:#ffb5a8}main:fullscreen{width:100vw;height:100vh}main:fullscreen video{height:100vh}main:fullscreen #placeholder{display:none}
+</style>
+<header>
+<h1>TailWindowAccess</h1>
+<button id="connect">Connect</button>
+<button id="disconnect" disabled>Disconnect</button>
+<button id="takeover">Take control</button>
+<button id="fullscreen">Fullscreen</button>
+<button id="paste" disabled>Paste to Linux</button>
+<button id="copy" disabled>Copy from Linux</button>
+<label for="quality">Quality</label><select id="quality"><option value="clear">Clear text</option><option value="low_data">Low data</option><option value="smooth">Smooth motion</option></select>
+<span id="status" role="status">Disconnected</span>
+</header>
+<div id="details"><span id="stream-info">Same live Linux desktop</span><label><input id="command-control" type="checkbox" checked> Mac Command sends Ctrl</label><span>US physical key mapping. Click the desktop before typing.</span></div>
+<main id="screen"><video id="video" autoplay playsinline muted tabindex="0" aria-label="Live Linux desktop"></video><div id="placeholder"><strong>Your Linux desktop, here.</strong>Connect through Tailscale to view and control the same screen on this machine. Audio is not included.</div></main>
+<div id="notice" role="status">Linux must stay awake and signed in. Disconnect releases remote keys and buttons.</div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const video = $('video');
+const state = { pc:null, channel:null, lease:null, epoch:null, generation:null, ready:false, clipboardReady:false, connecting:false, serial:0, callback:null, heartbeat:null, watchdog:null, lastMessage:0, mediaProgress:null, frames:new Map(), presentations:new Map(), keys:new Map(), blocked:new Set(), buttons:new Map(), rearmPointers:new Set(), inputRevision:null, pendingClipboard:new Map(), request:0, lock:"unknown", quality:'clear', intent:false, attemptController:null, offerPending:null, retryTimer:null, retryCount:0, recoveryStarted:null, reconnecting:false };
+const codes = {
+Escape:1,Digit1:2,Digit2:3,Digit3:4,Digit4:5,Digit5:6,Digit6:7,Digit7:8,Digit8:9,Digit9:10,Digit0:11,Minus:12,Equal:13,Backspace:14,Tab:15,
+KeyQ:16,KeyW:17,KeyE:18,KeyR:19,KeyT:20,KeyY:21,KeyU:22,KeyI:23,KeyO:24,KeyP:25,BracketLeft:26,BracketRight:27,Enter:28,ControlLeft:29,
+KeyA:30,KeyS:31,KeyD:32,KeyF:33,KeyG:34,KeyH:35,KeyJ:36,KeyK:37,KeyL:38,Semicolon:39,Quote:40,Backquote:41,ShiftLeft:42,Backslash:43,
+KeyZ:44,KeyX:45,KeyC:46,KeyV:47,KeyB:48,KeyN:49,KeyM:50,Comma:51,Period:52,Slash:53,ShiftRight:54,NumpadMultiply:55,AltLeft:56,Space:57,CapsLock:58,
+F1:59,F2:60,F3:61,F4:62,F5:63,F6:64,F7:65,F8:66,F9:67,F10:68,NumLock:69,ScrollLock:70,Numpad7:71,Numpad8:72,Numpad9:73,NumpadSubtract:74,Numpad4:75,Numpad5:76,Numpad6:77,NumpadAdd:78,Numpad1:79,Numpad2:80,Numpad3:81,Numpad0:82,NumpadDecimal:83,IntlBackslash:86,F11:87,F12:88,NumpadEnter:96,ControlRight:97,NumpadDivide:98,PrintScreen:99,AltRight:100,Home:102,ArrowUp:103,PageUp:104,ArrowLeft:105,ArrowRight:106,End:107,ArrowDown:108,PageDown:109,Insert:110,Delete:111,Pause:119,MetaLeft:125,MetaRight:126,ContextMenu:127
+};
+function notice(text, error=false) { $('notice').textContent=text; $('notice').classList.toggle('error',error); }
+function status(text) { $('status').textContent=text; }
+function readiness(ready) { if(state.ready&&!ready) invalidateInput(); state.ready=ready; }
+function clipboardReadiness(ready) {state.clipboardReady=ready; $('paste').disabled=!ready; $('copy').disabled=!ready;}
+async function api(path, body, timeout=10000) {
+ const controller=new AbortController();
+ let timer, expired=false;
+ const request=(async()=>{
+  const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-TWA-Request':'1'},body:JSON.stringify(body),cache:'no-store',signal:controller.signal});
+  if (!response.ok) {
+   let message='Request failed'; try { message=(await response.json()).error||message; } catch {}
+   const error=new Error(message); error.status=response.status; throw error;
+  }
+  return response.status===204 ? null : response.json();
+ })();
+ request.then(answer=>{if(expired && path==='/api/offer' && answer?.lease) stopLease(answer.lease);},()=>{});
+ try {
+  return await Promise.race([request,new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;controller.abort();reject(new Error('Request timed out'));},timeout);})]);
+ } finally {clearTimeout(timer);}
+}
+function stopLease(lease) { return lease ? api('/api/stop',{lease},1000).catch(()=>{}) : Promise.resolve(); }
+function send(message) {
+ const channel=state.channel;
+ if (!channel || channel.readyState!=='open' || channel.bufferedAmount>32*1024) return false;
+ try {channel.send(JSON.stringify(message)); return true;} catch {return false;}
+}
+function transition(message) {
+ if(send(message)) return true;
+ notice('The control channel stalled. Disconnecting to release Linux input.',true);
+ recover('Control stalled'); return false;
+}
+function trim(map) { while(map.size>180) map.delete(map.keys().next().value); }
+function acknowledge(rtp) {
+ const frame=state.frames.get(rtp), presentation=state.presentations.get(rtp);
+ if (!frame || !presentation || frame.epoch!==state.epoch) return;
+ if(send({type:'presented',epoch:frame.epoch,generation:frame.generation,rtp})) {
+  if(state.generation!==frame.generation) clipboardReadiness(false);
+  state.mediaProgress.lastMatchedAt=Math.max(state.mediaProgress.lastMatchedAt??-Infinity,presentation.at);
+  state.generation=frame.generation; state.frames.delete(rtp); state.presentations.delete(rtp); presentationReady();
+ }
+}
+function watchVideo(serial) {
+ state.callback=video.requestVideoFrameCallback((_,metadata)=>{
+  if(serial!==state.serial) return;
+  if(!Number.isInteger(metadata.rtpTimestamp)) {
+   notice('This browser does not provide RTP presentation metadata. Control is disabled.',true);
+   disconnect(); return;
+  }
+  state.presentations.set(metadata.rtpTimestamp,{at:performance.now()}); trim(state.presentations); acknowledge(metadata.rtpTimestamp);
+  $('placeholder').hidden=true;
+  watchVideo(serial);
+ });
+}
+function invalidateInput() {
+ for(const code of state.keys.keys()) state.blocked.add(code);
+ state.keys.clear();
+ const captured=[...state.buttons.keys(),...state.rearmPointers]; state.buttons.clear(); state.rearmPointers.clear();
+ for(const id of captured) releaseCapture(id);
+ pointer=null; pointerScheduled=false; ++pointerRevision;
+}
+function release() {
+ const revision=state.inputRevision;
+ invalidateInput(); readiness(false);
+ if(revision!==null&&!send({type:'release',revision})&&state.lease) recover('Control stalled');
+}
+function clearSession(reason) {
+ const lease=state.lease;
+ ++state.serial;
+ if(state.attemptController) state.attemptController.abort();
+ state.attemptController=null;
+ invalidateInput(); readiness(false); clipboardReadiness(false); if(state.inputRevision!==null) send({type:'release',revision:state.inputRevision});
+ clearInterval(state.heartbeat); clearInterval(state.watchdog); state.heartbeat=null; state.watchdog=null;
+ if(state.callback!==null && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(state.callback);
+ state.callback=null;
+ if(state.channel) state.channel.close();
+ if(state.pc) state.pc.close();
+ state.pc=null; state.channel=null; state.lease=null; state.epoch=null; state.generation=null; state.inputRevision=null; state.mediaProgress=null; state.lock='unknown'; state.connecting=false;
+ video.srcObject=null; state.frames.clear(); state.presentations.clear(); $('placeholder').hidden=false;
+ for(const pending of state.pendingClipboard.values()) pending.reject(new Error('Disconnected'));
+ state.pendingClipboard.clear();
+ $('connect').disabled=false; $('disconnect').disabled=true; status(reason);
+ return stopLease(lease);
+}
+function disconnect(reason='Disconnected') {
+ state.intent=false; state.reconnecting=false;
+ clearTimeout(state.retryTimer); state.retryTimer=null;
+ return clearSession(reason);
+}
+function recover(reason) {
+ if(!state.intent) return;
+ if(reason==='The desktop video stopped' || reason==='The first desktop frame did not arrive' || reason==='Smooth mode is falling behind') {
+  if(state.quality==='smooth') state.quality='clear';
+  else if(state.quality==='clear' && state.retryCount>=1) state.quality='low_data';
+  $('quality').value=state.quality;
+ }
+ clearTimeout(state.retryTimer); state.retryTimer=null;
+ clearSession('Reconnecting');
+ if(state.recoveryStarted===null) state.recoveryStarted=performance.now();
+ const remaining=60000-(performance.now()-state.recoveryStarted);
+ if(remaining<=0) {disconnect('Unavailable');notice('Recovery timed out. Use Connect to try again.',true);return;}
+ const serial=state.serial;
+ state.reconnecting=true;
+ notice(reason+'. Reconnecting.'); $('disconnect').disabled=false;
+ const delay=Math.min(2000,500*2**Math.min(state.retryCount++,2));
+ state.retryTimer=setTimeout(()=>{
+  state.retryTimer=null;
+  if(serial===state.serial && state.intent) {
+   if(performance.now()-state.recoveryStarted>=60000) {disconnect('Unavailable');notice('Recovery timed out. Use Connect to try again.',true);return;}
+   attempt(false,true);
+  }
+ },Math.min(delay,remaining));
+}
+function current(serial) {return serial===state.serial && state.intent;}
+function requireCurrent(serial) {if(!current(serial)) throw new Error('Session replaced');}
+function presentationReady() {
+ if(state.ready && state.generation!==null) {state.recoveryStarted=null;state.retryCount=0;state.reconnecting=false;}
+}
+function mediaStallReason(now) {
+ const progress=state.mediaProgress;
+ if(!progress || progress.visibleSince===null) return null;
+ if(state.quality==='smooth' && state.lock==='unlocked' && progress.pausedSince!==null && now-progress.pausedSince>=2500) return 'Smooth mode is falling behind';
+ if(progress.lastMatchedAt===null) return now-Math.max(progress.startedAt,progress.visibleSince)>=10000?'The first desktop frame did not arrive':null;
+ if(progress.pausedSince!==null && now-Math.max(progress.lastMatchedAt,progress.pausedSince,progress.visibleSince)>=3000) return 'The desktop video stopped';
+ return null;
+}
+function iceComplete(pc, signal) {
+ if(pc.iceGatheringState==='complete') return Promise.resolve();
+ return new Promise((resolve,reject)=>{
+  const timer=setTimeout(()=>finish(new Error('Private ICE gathering timed out')),5000);
+  function finish(error) {clearTimeout(timer);pc.removeEventListener('icegatheringstatechange',changed);signal.removeEventListener('abort',cancel);error?reject(error):resolve();}
+  function changed() {if(pc.iceGatheringState==='complete') finish();}
+  function cancel() {finish(new Error('Session replaced'));}
+  pc.addEventListener('icegatheringstatechange',changed); signal.addEventListener('abort',cancel,{once:true});
+  if(signal.aborted) cancel();
+ });
+}
+async function connect(takeover=false) {
+ disconnect();
+ state.intent=true; state.retryCount=0; state.recoveryStarted=performance.now();
+ if(!video.requestVideoFrameCallback) {disconnect();notice('This browser cannot verify video presentation. Use a current Comet browser.',true);return;}
+ return attempt(takeover);
+}
+async function attempt(takeover,automatic=false) {
+ if(!state.intent || state.connecting) return;
+ state.connecting=true; $('connect').disabled=true; $('disconnect').disabled=false; status('Connecting');
+ const serial=state.serial;
+ const controller=new AbortController(); state.attemptController=controller;
+ let timer;
+ try {
+  const timeout=Math.min(10000,60000-(performance.now()-state.recoveryStarted));
+  await Promise.race([establish(serial,takeover,controller.signal),new Promise((_,reject)=>{controller.signal.addEventListener('abort',()=>reject(new Error('Session replaced')),{once:true});}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Connection attempt timed out')),timeout);})]);
+ } catch(error) {
+  if(current(serial)) {
+   if([400,403].includes(error.status) || error.status===409 && !automatic) {disconnect();notice(error.message,true);}
+   else recover(error.message||'Connection unavailable');
+  }
+ } finally {clearTimeout(timer);if(state.attemptController===controller) state.attemptController=null;}
+}
+async function establish(serial,takeover,signal) {
+ const pc=new RTCPeerConnection({iceServers:[],bundlePolicy:'max-bundle'}); state.pc=pc;
+ const transceiver=pc.addTransceiver('video',{direction:'recvonly'});
+ if('jitterBufferTarget' in transceiver.receiver) transceiver.receiver.jitterBufferTarget=0;
+ const codecs=RTCRtpReceiver.getCapabilities('video')?.codecs;
+ if(codecs && transceiver.setCodecPreferences) {
+  const h264=codecs.filter(c=>c.mimeType.toLowerCase()==='video/h264' && /packetization-mode=1/.test(c.sdpFmtpLine||'') && /profile-level-id=42e0/i.test(c.sdpFmtpLine||''));
+  if(!h264.length) {const error=new Error('This browser has no compatible H.264 desktop decoder');error.status=400;throw error;}
+  transceiver.setCodecPreferences([...h264,...codecs.filter(c=>c.mimeType.toLowerCase()==='video/rtx')]);
+ }
+ const channel=pc.createDataChannel('control',{ordered:true}); state.channel=channel;
+ channel.onopen=()=>{if(current(serial) && state.lease) send({type:'hello',lease:state.lease});};
+ channel.onmessage=event=>{
+  if(!current(serial)) return;
+  let message; try {message=JSON.parse(event.data);} catch {return;}
+  state.lastMessage=performance.now();
+  if(message.type==='hello') {if(message.epoch!==state.epoch) {disconnect('Invalid session');return;}state.inputRevision=message.input_revision;status('Waiting for current display');}
+  if(message.type==='frame' && message.epoch===state.epoch) {state.frames.set(message.rtp,message);trim(state.frames);acknowledge(message.rtp);presentationReady();}
+  if(message.type==='input_reset' && /^\d+$/.test(message.revision) && (state.inputRevision===null||BigInt(message.revision)>BigInt(state.inputRevision))) {
+   invalidateInput(); readiness(false); state.inputRevision=message.revision;
+   transition({type:'input_reset_ack',revision:message.revision});
+   notice(state.blocked.size?'Release held keys before continuing, or click without modifiers to resume.':'Control paused while the current display catches up.');
+  }
+  if(message.type==='state' && message.input_revision===state.inputRevision) {
+   if(state.mediaProgress) {
+    if(message.ready===true) state.mediaProgress.pausedSince=null;
+    else if(state.mediaProgress.pausedSince===null) state.mediaProgress.pausedSince=performance.now();
+   }
+   state.lock=message.lock; clipboardReadiness(message.clipboard_ready===true&&message.lock==='unlocked'&&message.generation===state.generation); readiness(message.ready); presentationReady();
+   status(message.ready?'Connected':message.lock==='unknown'?'Desktop unavailable':'Waiting for current display');
+   $('stream-info').textContent=`${message.bitrate_kbps} kbps budget · ${message.fps} fps capture · ${message.lock}`;
+  }
+  if(message.type==='clipboard') {const pending=state.pendingClipboard.get(message.request);if(pending) {state.pendingClipboard.delete(message.request);message.ok?pending.resolve(message.text):pending.reject(new Error(message.error||'Linux clipboard is unavailable or locked'));}}
+  if(message.type==='reset') recover(message.reason||'Desktop changed');
+ };
+ channel.onclose=()=>{if(current(serial)) recover('Connection ended');};
+ pc.ontrack=event=>{if(current(serial)){video.srcObject=new MediaStream([event.track]);video.play().catch(()=>{});watchVideo(serial);}};
+ pc.onconnectionstatechange=()=>{if(current(serial)&&['failed','disconnected','closed'].includes(pc.connectionState)) recover('Connection lost');};
+ const offer=await pc.createOffer(); requireCurrent(serial);
+ await pc.setLocalDescription(offer); requireCurrent(serial);
+ await iceComplete(pc,signal); requireCurrent(serial);
+ if(state.offerPending) {await state.offerPending.catch(()=>{});requireCurrent(serial);}
+ const response=api('/api/offer',{sdp:pc.localDescription.sdp,takeover,quality:state.quality});
+ state.offerPending=response;
+ response.then(answer=>{if(state.offerPending===response) state.offerPending=null;if(!current(serial)) stopLease(answer.lease);},()=>{if(state.offerPending===response) state.offerPending=null;});
+ const answer=await response; requireCurrent(serial);
+ state.lease=answer.lease; state.epoch=answer.epoch;
+ const startedAt=performance.now();
+ state.mediaProgress={startedAt,visibleSince:document.hidden?null:startedAt,lastMatchedAt:null,pausedSince:null};
+ await pc.setRemoteDescription({type:'answer',sdp:answer.sdp}); requireCurrent(serial);
+ state.connecting=false; state.lastMessage=performance.now();
+ state.heartbeat=setInterval(()=>send({type:'heartbeat'}),500);
+ state.watchdog=setInterval(()=>{
+  if(!current(serial)) return;
+  const now=performance.now();
+  if(now-state.lastMessage>=3000) recover('The desktop stream stopped');
+  else if(state.recoveryStarted!==null && now-state.recoveryStarted>=60000) {disconnect('Unavailable');notice('Recovery timed out. Use Connect to try again.',true);}
+  else {const reason=mediaStallReason(now);if(reason) recover(reason);}
+ },500);
+ notice('Click the live desktop to control Linux. Clipboard buttons exchange plain text.');
+}
+function position(event) {
+ if(!video.videoWidth||!video.videoHeight) return null;
+ const bounds=video.getBoundingClientRect(); const scale=Math.min(bounds.width/video.videoWidth,bounds.height/video.videoHeight);
+ const width=video.videoWidth*scale,height=video.videoHeight*scale;
+ const x=(event.clientX-bounds.left-(bounds.width-width)/2)/width;
+ const y=(event.clientY-bounds.top-(bounds.height-height)/2)/height;
+ if(x<0||x>1||y<0||y>1) return null;
+ return {x,y,generation:state.generation};
+}
+let pointer=null, pointerScheduled=false, pointerRevision=0;
+const modifierFlag = code => code.startsWith('Shift')?'shiftKey':code.startsWith('Control')?'ctrlKey':code.startsWith('Alt')?'altKey':code.startsWith('Meta')?'metaKey':null;
+function modifiersKnown(event, pressing=null) {
+ for(const flag of ['shiftKey','ctrlKey','altKey','metaKey']) {
+  if(event[flag] && modifierFlag(pressing||'')!==flag && ![...state.keys.keys()].some(code=>modifierFlag(code)===flag)) return false;
+ }
+ return true;
+}
+function keyUp(code) {
+ const remote=state.keys.get(code);
+ if(remote===undefined) return;
+ state.keys.delete(code);
+ if(![...state.keys.values()].includes(remote)) transition({type:'key',revision:state.inputRevision,generation:state.generation,code:remote,down:false});
+}
+video.addEventListener('pointermove',event=>{
+ if(!state.ready||state.blocked.size||!modifiersKnown(event)) return;
+ pointer=position(event);
+ if(!pointerScheduled) {
+  const serial=state.serial,revision=pointerRevision; pointerScheduled=true;
+  requestAnimationFrame(()=>{
+   if(revision!==pointerRevision) return;
+   pointerScheduled=false;
+   if(pointer&&state.ready&&serial===state.serial) send({type:'pointer',revision:state.inputRevision,...pointer});
+   pointer=null;
+  });
+ }
+});
+function releaseCapture(id) {if(video.hasPointerCapture(id)) video.releasePointerCapture(id);}
+video.addEventListener('pointerdown',event=>{
+ if(!state.ready) return;
+ const p=position(event); if(!p) return;
+ event.preventDefault();video.focus();
+ if((state.blocked.size&&(event.shiftKey||event.ctrlKey||event.altKey||event.metaKey)) || !modifiersKnown(event)) {notice('Release held modifiers before continuing.',true);return;}
+ try {video.setPointerCapture(event.pointerId);} catch {return;}
+ if(state.blocked.size) {
+  state.blocked.clear(); state.rearmPointers.add(event.pointerId); notice('Control resumed.'); return;
+ }
+ if(transition({type:'button',revision:state.inputRevision,...p,button:event.button,down:true})) state.buttons.set(event.pointerId,event.button);
+ else releaseCapture(event.pointerId);
+});
+video.addEventListener('pointerup',event=>{
+ event.preventDefault();
+ if(state.rearmPointers.delete(event.pointerId)) {releaseCapture(event.pointerId);return;}
+ const button=state.buttons.get(event.pointerId); state.buttons.delete(event.pointerId);
+ const p=position(event);
+ if(button!==undefined) {
+  if(state.ready&&p) transition({type:'button',revision:state.inputRevision,...p,button,down:false}); else release();
+ }
+ releaseCapture(event.pointerId);
+});
+function cancelPointer(event) {
+ state.rearmPointers.delete(event.pointerId);
+ const pressed=state.buttons.delete(event.pointerId);
+ releaseCapture(event.pointerId);
+ if(pressed) release();
+}
+video.addEventListener('pointercancel',cancelPointer);
+video.addEventListener('lostpointercapture',cancelPointer);
+video.addEventListener('contextmenu',event=>event.preventDefault());
+video.addEventListener('wheel',event=>{
+ if(!state.ready||state.blocked.size||!modifiersKnown(event)) return;
+ const p=position(event);if(!p)return;
+ event.preventDefault(); const factor=event.deltaMode===1?16:event.deltaMode===2?video.clientHeight:1;
+ transition({type:'scroll',revision:state.inputRevision,...p,dx:Math.max(-10000,Math.min(10000,event.deltaX*factor/10)),dy:Math.max(-10000,Math.min(10000,event.deltaY*factor/10))});
+},{passive:false});
+video.addEventListener('keydown',event=>{
+ if(!state.ready) return;
+ event.preventDefault(); if(event.repeat||state.keys.has(event.code))return;
+ if(state.blocked.size||!modifiersKnown(event,event.code)) {notice('Release held keys before continuing, or click without modifiers to resume.',true);return;}
+ let code=codes[event.code];
+ if($('command-control').checked&&(event.code==='MetaLeft'||event.code==='MetaRight')) code=event.code==='MetaLeft'?29:97;
+ if(!code) {notice('This physical key is not mapped.',true);return;}
+ if([...state.keys.values()].includes(code)||transition({type:'key',revision:state.inputRevision,generation:state.generation,code,down:true})) state.keys.set(event.code,code);
+});
+video.addEventListener('keyup',event=>{
+ if(state.blocked.delete(event.code)) {event.preventDefault();return;}
+ if(!state.keys.has(event.code))return;
+ event.preventDefault();
+ if(modifierFlag(event.code)==='metaKey') {
+  for(const code of [...state.keys.keys()]) if(!modifierFlag(code)) keyUp(code);
+ }
+ keyUp(event.code);
+});
+video.addEventListener('blur',release);
+window.addEventListener('blur',release);
+document.addEventListener('visibilitychange',()=>{
+ const progress=state.mediaProgress;
+ if(progress) {
+  if(document.hidden) progress.visibleSince=null;
+  else if(progress.visibleSince===null) progress.visibleSince=performance.now();
+ }
+ if(document.hidden) release();
+});
+window.addEventListener('pagehide',()=>disconnect());
+function clipboard(type,text) {
+ return new Promise((resolve,reject)=>{
+  const request=++state.request;
+  const message={type,request,...(text===undefined?{}:{text})};
+  if(new TextEncoder().encode(JSON.stringify(message)).length>72*1024) {reject(new Error('Clipboard text exceeds the 72 KiB encoded transfer limit'));return;}
+  const timer=setTimeout(()=>{state.pendingClipboard.delete(request);reject(new Error('Clipboard request timed out'));},5000);
+  state.pendingClipboard.set(request,{resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}});
+  if(!send(message)) {clearTimeout(timer);state.pendingClipboard.delete(request);reject(new Error('Control channel is unavailable'));}
+ });
+}
+$('connect').onclick=()=>connect(); $('takeover').onclick=()=>connect(true); $('disconnect').onclick=()=>disconnect();
+$('quality').onchange=()=>{
+ const quality=$('quality').value;
+ if(quality===state.quality) return;
+ state.quality=quality;
+ if(state.intent) {state.recoveryStarted=performance.now();state.retryCount=0;recover('Quality changed');}
+};
+$('fullscreen').onclick=async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await $('screen').requestFullscreen();video.focus();}catch{notice('Fullscreen was denied by the browser.',true);}};
+function clipboardSession() {return {serial:state.serial,lease:state.lease,generation:state.generation};}
+function clipboardCurrent(session) {return session.serial===state.serial && session.lease!==null && session.lease===state.lease && session.generation!==null && session.generation===state.generation && state.clipboardReady && state.lock==='unlocked';}
+function requireClipboard(session) {if(!clipboardCurrent(session)) throw new Error('Clipboard session changed');}
+$('paste').onclick=async()=>{
+ const session=clipboardSession();
+ try {
+  requireClipboard(session);
+  const text=await navigator.clipboard.readText(); requireClipboard(session);
+  if(new TextEncoder().encode(text).length>65536) throw new Error('Clipboard text exceeds 64 KiB');
+  await clipboard('clipboard_write',text); requireClipboard(session);
+  notice('Plain text copied to the Linux clipboard. Paste it inside Linux with Ctrl+V.');
+ } catch(error) {if(clipboardCurrent(session)) notice(error.message||'Browser clipboard permission denied',true);}
+};
+$('copy').onclick=async()=>{
+ const session=clipboardSession();
+ try {
+  requireClipboard(session);
+  const text=await clipboard('clipboard_read'); requireClipboard(session);
+  await navigator.clipboard.writeText(text); requireClipboard(session);
+  notice('Linux clipboard text copied to this browser clipboard.');
+ } catch(error) {if(clipboardCurrent(session)) notice(error.message||'Browser clipboard permission denied',true);}
+};
+window.tailWindowAccess={connect,disconnect,state};
+</script>
+</html>
