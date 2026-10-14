@@ -471,11 +471,14 @@ test('a lost accepted answer retries conflicts until the unknown lease expires',
  await h.app.disconnect();
 });
 
-test('a lost Stop retries conflicts until the old controller reaches its deadman', async()=>{
+test('a lost Stop blocks replacement until the old controller reaches its deadman', async()=>{
  const h = harness(); await h.app.connect(); h.ready();
  const oldLease = h.app.state.lease, original = h.env.fetch;
  h.env.fetch = call => {
-  if (call.path === '/api/stop') return new Promise((_,reject)=>call.signal.addEventListener('abort',()=>reject(new Error('Stop lost'))));
+  if (call.path === '/api/stop') {
+   if (call.at >= 15000) return Promise.resolve({status:409, ok:false, json:async()=>({error:'Old controller expired'})});
+   return new Promise((_,reject)=>call.signal.addEventListener('abort',()=>reject(new Error('Stop lost'))));
+  }
   if (call.at < 15000) return Promise.resolve({status:409, ok:false, json:async()=>({error:'Old controller active'})});
   return original(call);
  };
@@ -483,8 +486,10 @@ test('a lost Stop retries conflicts until the old controller reaches its deadman
  await h.advance(14500);
  assert.equal(h.app.state.intent, true);
  assert.equal(h.app.state.lease, null);
- assert.deepEqual(h.calls.filter(call=>call.path === '/api/stop').map(call=>call.body.lease), [oldLease]);
- await h.advance(1000); h.ready();
+ assert.equal(offers(h).length, 1);
+ assert.ok(h.calls.filter(call=>call.path === '/api/stop').length > 1);
+ assert.ok(h.calls.filter(call=>call.path === '/api/stop').every(call=>call.body.lease===oldLease));
+ await h.advance(2500); h.ready();
  assert.equal(h.app.state.lease, '2'.padStart(64, '0'));
  assert.equal(h.app.state.recoveryStarted, null);
  assert.ok(offers(h).every(call=>call.body.takeover === false));
@@ -609,15 +614,16 @@ test('a late parsed answer after request timeout still releases its accepted lea
  await h.app.disconnect();
 });
 
-test('a blocked Stop request cannot hold reconnect indefinitely', async()=>{
+test('a blocked Stop request cannot offer over the old session or retry indefinitely', async()=>{
  const h = harness(); await h.app.connect(); h.ready();
  const original = h.env.fetch;
  h.env.fetch = call => call.path === '/api/stop' ? new Promise((_,reject)=>call.signal.addEventListener('abort',()=>reject(new Error('aborted')))) : original(call);
  h.message({type:'reset', reason:'Desktop changed'});
  await h.advance(500);
- assert.equal(offers(h).length, 2);
- await h.advance(500); h.ready();
- const stopped = h.app.disconnect(); await h.advance(1000); await stopped;
+ assert.equal(offers(h).length, 1);
+ await h.advance(59500);
+ assert.equal(h.app.state.intent, false);
+ assert.equal(offers(h).length, 1);
  assert.equal(h.timers.size, 0);
 });
 
@@ -690,6 +696,49 @@ test('quality change releases held input and starts a fresh session at the selec
  h.element('quality').value='low_data';h.element('quality').onchange();await h.advance(500);
  assert.equal(offers(h)[2].body.quality,'low_data');
  await h.app.disconnect();
+});
+
+test('quality change waits for the old lease to retire before offering a new stream',async()=>{
+ const h=harness(),stop=deferred(),fetch=h.env.fetch;
+ await h.app.connect();h.ready();
+ h.env.fetch=call=>call.path==='/api/stop'?stop.promise:fetch(call);
+ h.element('quality').value='low_data';h.element('quality').onchange();
+ await h.advance(500);
+ assert.equal(offers(h).length,1,'new offer must wait for stop confirmation');
+ stop.resolve({status:204,ok:true});await h.settle();
+ assert.equal(offers(h).length,2);
+ assert.equal(offers(h)[1].body.quality,'low_data');
+ await h.app.disconnect();
+});
+
+test('an unconfirmed stop blocks the replacement until the old lease is absent',async()=>{
+ const h=harness(),retry=deferred(),fetch=h.env.fetch;
+ await h.app.connect();h.ready();
+ let stops=0;
+ h.env.fetch=call=>{
+  if(call.path!=='/api/stop') return fetch(call);
+  return ++stops===1?{status:503,ok:false,json:async()=>({error:'Stop not confirmed'})}:retry.promise;
+ };
+ h.element('quality').value='low_data';h.element('quality').onchange();
+ await h.advance(500);
+ assert.equal(stops,2);
+ assert.equal(offers(h).length,1);
+ retry.resolve({status:409,ok:false,json:async()=>({error:'Lease is no longer current'})});
+ await h.settle();
+ assert.equal(offers(h).length,2);
+ await h.app.disconnect();
+});
+
+test('a completed retirement cannot reopen a manually disconnected session',async()=>{
+ const h=harness(),stop=deferred(),fetch=h.env.fetch;
+ await h.app.connect();h.ready();
+ h.env.fetch=call=>call.path==='/api/stop'?stop.promise:fetch(call);
+ h.element('quality').value='low_data';h.element('quality').onchange();
+ await h.advance(500);
+ await h.app.disconnect();
+ stop.resolve({status:204,ok:true});await h.settle();await h.advance(1000);
+ assert.equal(offers(h).length,1);
+ assert.equal(h.app.state.ready,false);
 });
 
 test('a stalled smooth stream reconnects in clear mode',async()=>{

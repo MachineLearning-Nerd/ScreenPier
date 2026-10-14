@@ -24,7 +24,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const video = $('video');
-const state = { pc:null, channel:null, lease:null, epoch:null, generation:null, ready:false, clipboardReady:false, connecting:false, serial:0, callback:null, heartbeat:null, watchdog:null, lastMessage:0, mediaProgress:null, frames:new Map(), presentations:new Map(), keys:new Map(), blocked:new Set(), buttons:new Map(), rearmPointers:new Set(), inputRevision:null, pendingClipboard:new Map(), request:0, lock:"unknown", quality:'clear', intent:false, attemptController:null, offerPending:null, retryTimer:null, retryCount:0, recoveryStarted:null, reconnecting:false };
+const state = { pc:null, channel:null, lease:null, epoch:null, generation:null, ready:false, clipboardReady:false, connecting:false, serial:0, callback:null, heartbeat:null, watchdog:null, lastMessage:0, mediaProgress:null, frames:new Map(), presentations:new Map(), keys:new Map(), blocked:new Set(), buttons:new Map(), rearmPointers:new Set(), inputRevision:null, pendingClipboard:new Map(), retirements:new Map(), request:0, lock:"unknown", quality:'clear', intent:false, attemptController:null, offerPending:null, retryTimer:null, retryCount:0, recoveryStarted:null, reconnecting:false };
 const codes = {
 Escape:1,Digit1:2,Digit2:3,Digit3:4,Digit4:5,Digit5:6,Digit6:7,Digit7:8,Digit8:9,Digit9:10,Digit0:11,Minus:12,Equal:13,Backspace:14,Tab:15,
 KeyQ:16,KeyW:17,KeyE:18,KeyR:19,KeyT:20,KeyY:21,KeyU:22,KeyI:23,KeyO:24,KeyP:25,BracketLeft:26,BracketRight:27,Enter:28,ControlLeft:29,
@@ -47,12 +47,23 @@ async function api(path, body, timeout=10000) {
   }
   return response.status===204 ? null : response.json();
  })();
- request.then(answer=>{if(expired && path==='/api/offer' && answer?.lease) stopLease(answer.lease);},()=>{});
+ request.then(answer=>{if(expired && path==='/api/offer' && answer?.lease) stopLease(answer.lease).catch(()=>{});},()=>{});
  try {
   return await Promise.race([request,new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;controller.abort();reject(new Error('Request timed out'));},timeout);})]);
  } finally {clearTimeout(timer);}
 }
-function stopLease(lease) { return lease ? api('/api/stop',{lease},1000).catch(()=>{}) : Promise.resolve(); }
+function stopLease(lease) {
+ if(!lease) return Promise.resolve();
+ if(!state.retirements.has(lease)) state.retirements.set(lease,null);
+ const pending=state.retirements.get(lease);
+ if(pending) return pending;
+ const request=api('/api/stop',{lease},1000).then(
+  ()=>{state.retirements.delete(lease);},
+  error=>{if(error.status===409) state.retirements.delete(lease);else {state.retirements.set(lease,null);throw error;}}
+ );
+ state.retirements.set(lease,request);
+ return request;
+}
 function send(message) {
  const channel=state.channel;
  if (!channel || channel.readyState!=='open' || channel.bufferedAmount>32*1024) return false;
@@ -113,7 +124,7 @@ function clearSession(reason) {
  for(const pending of state.pendingClipboard.values()) pending.reject(new Error('Disconnected'));
  state.pendingClipboard.clear();
  $('connect').disabled=false; $('disconnect').disabled=true; status(reason);
- return stopLease(lease);
+ return stopLease(lease).catch(()=>{});
 }
 function disconnect(reason='Disconnected') {
  state.intent=false; state.reconnecting=false;
@@ -191,6 +202,8 @@ async function attempt(takeover,automatic=false) {
  } finally {clearTimeout(timer);if(state.attemptController===controller) state.attemptController=null;}
 }
 async function establish(serial,takeover,signal) {
+ if(state.offerPending) {await state.offerPending.catch(()=>{});requireCurrent(serial);}
+ await Promise.all([...state.retirements.keys()].map(stopLease));requireCurrent(serial);
  const pc=new RTCPeerConnection({iceServers:[],bundlePolicy:'max-bundle'}); state.pc=pc;
  const transceiver=pc.addTransceiver('video',{direction:'recvonly'});
  if('jitterBufferTarget' in transceiver.receiver) transceiver.receiver.jitterBufferTarget=0;
@@ -231,10 +244,9 @@ async function establish(serial,takeover,signal) {
  const offer=await pc.createOffer(); requireCurrent(serial);
  await pc.setLocalDescription(offer); requireCurrent(serial);
  await iceComplete(pc,signal); requireCurrent(serial);
- if(state.offerPending) {await state.offerPending.catch(()=>{});requireCurrent(serial);}
  const response=api('/api/offer',{sdp:pc.localDescription.sdp,takeover,quality:state.quality});
  state.offerPending=response;
- response.then(answer=>{if(state.offerPending===response) state.offerPending=null;if(!current(serial)) stopLease(answer.lease);},()=>{if(state.offerPending===response) state.offerPending=null;});
+ response.then(answer=>{if(state.offerPending===response) state.offerPending=null;if(!current(serial)) stopLease(answer.lease).catch(()=>{});},()=>{if(state.offerPending===response) state.offerPending=null;});
  const answer=await response; requireCurrent(serial);
  state.lease=answer.lease; state.epoch=answer.epoch;
  const startedAt=performance.now();
