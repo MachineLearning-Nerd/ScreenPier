@@ -251,7 +251,9 @@ impl PacerQueueRecord {
 pub struct DiagRecord {
     pub version: u8,
     pub session: u64,
+    pub trace_id: u64,
     pub elapsed_ms: u64,
+    pub terminal: bool,
     pub bitrate_kbps: u32,
     pub fps: u32,
     pub bwe_estimate_bps: Option<u64>,
@@ -291,6 +293,7 @@ pub struct PeerSnapshot {
     pub presented_age: Option<Duration>,
     pub ack_age: Option<Duration>,
     pub pacer_queue: Option<PacerQueueRecord>,
+    pub terminal: bool,
 }
 
 pub struct PeerDiagnostics {
@@ -298,6 +301,7 @@ pub struct PeerDiagnostics {
     pub input_admitted: u64,
     pub input_denied: u64,
     pub session: u64,
+    trace_id: u64,
     pub encoder_starts: u64,
     pub keyframe_requests: u64,
     pub(crate) encoder_allocation: Option<crate::allocation::Allocation>,
@@ -320,6 +324,7 @@ impl PeerDiagnostics {
             input_admitted: 0,
             input_denied: 0,
             session: 0,
+            trace_id: rand::random(),
             encoder_starts: 0,
             keyframe_requests: 0,
             encoder_allocation: None,
@@ -351,8 +356,9 @@ impl PeerDiagnostics {
         } = observation;
         self.readiness_sequence = self.readiness_sequence.saturating_add(1);
         ReadinessRecord {
-            version: 2,
+            version: 3,
             session: self.session,
+            trace_id: self.trace_id,
             sequence: self.readiness_sequence,
             elapsed_us: crate::session::micros(now.saturating_duration_since(self.started)),
             readiness_event: event as u8,
@@ -410,11 +416,14 @@ impl PeerDiagnostics {
             presented_age,
             ack_age,
             pacer_queue,
+            terminal,
         } = snapshot;
         DiagRecord {
-            version: 2,
+            version: 4,
             session: self.session,
+            trace_id: self.trace_id,
             elapsed_ms: now.saturating_duration_since(self.started).as_millis() as u64,
+            terminal,
             bitrate_kbps,
             fps,
             bwe_estimate_bps,
@@ -503,6 +512,7 @@ pub(crate) struct ReadinessObservation {
 pub(crate) struct ReadinessRecord {
     pub version: u8,
     pub session: u64,
+    pub trace_id: u64,
     pub sequence: u64,
     pub elapsed_us: u64,
     pub readiness_event: u8,
@@ -788,6 +798,7 @@ mod tests {
     fn record(now: Instant) -> DiagRecord {
         let mut diagnostics = PeerDiagnostics::new(now);
         diagnostics.session = 3;
+        diagnostics.trace_id = 42;
         diagnostics.received_ack_frame_last_ms = Some(120);
         diagnostics.encoding = Some(EncodingTimings {
             capture_to_submit_ms: 15,
@@ -825,6 +836,7 @@ mod tests {
                     bytes: 2048,
                     packets: 3,
                 }),
+                terminal: false,
             },
         )
     }
@@ -838,6 +850,7 @@ mod tests {
     fn readiness(now: Instant) -> ReadinessRecord {
         let mut diagnostics = PeerDiagnostics::new(now);
         diagnostics.session = 3;
+        diagnostics.trace_id = 42;
         diagnostics.readiness_record(
             now + Duration::from_micros(12),
             ReadinessObservation {
@@ -872,7 +885,7 @@ mod tests {
         assert_eq!(
             actual,
             json!({
-                "version":2,"session":3,"sequence":1,"elapsed_us":12,"readiness_event":1,"reason":9,
+                "version":3,"session":3,"trace_id":42,"sequence":1,"elapsed_us":12,"readiness_event":1,"reason":9,
                 "ready_before":true,"ready_after":false,"authority_phase":0,"input_revision":4,
                 "authority_phase_after":null,"input_revision_after":null,"submitted_revision":null,"message_revision":null,
                 "acknowledgement_accepted":null,"generation":null,"heartbeat_age_us":0,
@@ -1031,16 +1044,15 @@ mod tests {
         let bytes = serde_json::to_vec(&record(Instant::now())).unwrap();
         assert!(bytes.len() < MAX_RECORD_BYTES);
         let actual: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            actual,
-            json!({
-                "version":2,"session":3,"elapsed_ms":10,"bitrate_kbps":700,"fps":8,"bwe_estimate_bps":900000,"allocation":null,"encoder_starts":0,"encoder_restarts":0,"keyframe_requests":0,"encoder_kbps":null,"encoder_fps":null,"frames":6,"input_ready":false,
-                "input_received":0,"input_admitted":0,"input_denied":0,
-                "actor":{"capture_last_ms":0,"capture_timeout_sync":2,"capture_timeout_constraints":3,"capture_timeout_ready":5,"capture_timeout_consecutive":1,"capture_failed_last_ms":120,"conversion_last_ms":0,"comparison_last_ms":0,"input_queue_last_ms":0,"lock_query_last_ms":0,"lock_query_sequence":0,"lock_query_outcome":0,"lock_query_counts":[0,0,0,0,0,0,0,0],"lock_observed_us":0,"lock_query_us":0,"cancellations":0,"rejected_inputs":0,"input_completed":0,"input_expired":0,"input_cancelled":0,"input_failed":0},
-                "encoder":{"capture_to_submit_last_ms":15,"capture_to_selected_last_ms":10,"raw_write_last_ms":5,"raw_accepted":4,"raw_replaced":2,"raw_contended":1,"submit_to_output_last_ms":9,"capture_to_output_last_ms":24},
-                "capture_to_writer_last_ms":null,"pacer_queue":{"sample_age_ms":4,"first_unsent_age_ms":80,"bytes":2048,"packets":3},"received_ack_frame_last_ms":120,"presented_frame_age_ms":130,"time_since_accepted_ack_ms":10,"rtc_tick_gap_max_ms":0,"due_timeout_lateness_max_ms":0,"fault":"encoder_framing","log_dropped":0,"log_failed":false
-            })
-        );
+        let mut expected = json!({
+            "version":4,"session":3,"elapsed_ms":10,"terminal":false,"bitrate_kbps":700,"fps":8,"bwe_estimate_bps":900000,"allocation":null,"encoder_starts":0,"encoder_restarts":0,"keyframe_requests":0,"encoder_kbps":null,"encoder_fps":null,"frames":6,"input_ready":false,
+            "input_received":0,"input_admitted":0,"input_denied":0,
+            "actor":{"capture_last_ms":0,"capture_timeout_sync":2,"capture_timeout_constraints":3,"capture_timeout_ready":5,"capture_timeout_consecutive":1,"capture_failed_last_ms":120,"conversion_last_ms":0,"comparison_last_ms":0,"input_queue_last_ms":0,"lock_query_last_ms":0,"lock_query_sequence":0,"lock_query_outcome":0,"lock_query_counts":[0,0,0,0,0,0,0,0],"lock_observed_us":0,"lock_query_us":0,"cancellations":0,"rejected_inputs":0,"input_completed":0,"input_expired":0,"input_cancelled":0,"input_failed":0},
+            "encoder":{"capture_to_submit_last_ms":15,"capture_to_selected_last_ms":10,"raw_write_last_ms":5,"raw_accepted":4,"raw_replaced":2,"raw_contended":1,"submit_to_output_last_ms":9,"capture_to_output_last_ms":24},
+            "capture_to_writer_last_ms":null,"pacer_queue":{"sample_age_ms":4,"first_unsent_age_ms":80,"bytes":2048,"packets":3},"received_ack_frame_last_ms":120,"presented_frame_age_ms":130,"time_since_accepted_ack_ms":10,"rtc_tick_gap_max_ms":0,"due_timeout_lateness_max_ms":0,"fault":"encoder_framing","log_dropped":0,"log_failed":false
+        });
+        expected["trace_id"] = json!(42);
+        assert_eq!(actual, expected);
         assert!(matches!(
             FaultReason::from_safe_reason("unknown private detail"),
             FaultReason::Operation

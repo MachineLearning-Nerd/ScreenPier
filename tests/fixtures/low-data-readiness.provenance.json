@@ -1,0 +1,5 @@
+{
+  "source_sha256": "13278db9fa3eb135cb12257406588aa8c51273931d082b1b745479da28a47d1e",
+  "selection": "All readiness events and the final stopped peer record; fields limited to relative time, readiness state, reason, sequence, and logger health.",
+  "profile": "Physical 1920x1080 Linux Chromium fixture; Low data 560 kbps; route 5 -> 0.5 -> 5 Mbps, 200 ms added RTT, 2% random loss; one historical run."
+}

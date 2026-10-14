@@ -1229,7 +1229,7 @@ impl Peer {
         }
         self.capture(config, socket, Instant::now(), log)
     }
-    fn log_snapshot(&mut self, log: Option<&DiagnosticsLog>, now: Instant) {
+    fn log_snapshot(&mut self, log: Option<&DiagnosticsLog>, now: Instant, terminal: bool) {
         if let Some(log) = log {
             let pacer_queue = self.pacer_queue(now);
             log.submit(self.diagnostics.record(
@@ -1248,6 +1248,7 @@ impl Peer {
                     presented_age: self.progress.as_ref().and_then(|p| p.presented_age(now)),
                     ack_age: self.progress.as_ref().and_then(|p| p.accepted_ack_age(now)),
                     pacer_queue,
+                    terminal,
                 },
             ));
         }
@@ -1332,7 +1333,7 @@ pub fn run_host(
                     }
                     if let Some(active) = peer.as_mut() {
                         active.diagnostics.fail(FaultReason::Replaced);
-                        active.log_snapshot(diagnostics.as_deref(), Instant::now());
+                        active.log_snapshot(diagnostics.as_deref(), Instant::now(), true);
                     }
                     peer = None;
                     let mut session_config = config.clone();
@@ -1367,7 +1368,7 @@ pub fn run_host(
                     if current {
                         if let Some(active) = peer.as_mut() {
                             active.diagnostics.fail(FaultReason::Stopped);
-                            active.log_snapshot(diagnostics.as_deref(), Instant::now());
+                            active.log_snapshot(diagnostics.as_deref(), Instant::now(), true);
                         }
                         peer = None;
                     }
@@ -1418,7 +1419,7 @@ pub fn run_host(
                 active.revoke_input();
             }
             if failure.is_some() || active.diagnostics.due(Instant::now()) {
-                active.log_snapshot(diagnostics.as_deref(), Instant::now());
+                active.log_snapshot(diagnostics.as_deref(), Instant::now(), failure.is_some());
             }
         }
         if let Some(error) = failure {
@@ -1487,7 +1488,7 @@ pub fn run_host(
     }
     if let Some(active) = peer.as_mut() {
         active.diagnostics.fail(FaultReason::Stopped);
-        active.log_snapshot(diagnostics.as_deref(), Instant::now());
+        active.log_snapshot(diagnostics.as_deref(), Instant::now(), true);
     }
     drop(peer);
     let shutdown_deadline = Instant::now() + Duration::from_secs(2);
@@ -1665,11 +1666,34 @@ mod tests {
         );
         assert_eq!(peer.allocation.pending(), None);
         let (log, receiver) = DiagnosticsLog::stalled();
-        peer.log_snapshot(Some(&log), Instant::now());
+        peer.log_snapshot(Some(&log), Instant::now(), false);
         let crate::diagnostics::LogRecord::Peer(record) = receiver.try_recv().unwrap() else {
             panic!("peer diagnostic record required");
         };
         assert_eq!(record.bwe_estimate_bps, Some(100_000));
+    }
+    #[test]
+    fn terminal_snapshot_distinguishes_peer_end_from_a_reset_fault() {
+        let (mut peer, _) = Peer::new(
+            include_str!("fixtures/recvonly-h264.sdp").into(),
+            &config(),
+            "127.0.0.1:6081".parse().unwrap(),
+            None,
+            RateMode::Fixed { fps: 15 },
+        )
+        .unwrap();
+        peer.diagnostics.fail(FaultReason::LockChanged);
+        let (log, receiver) = DiagnosticsLog::stalled();
+        peer.log_snapshot(Some(&log), Instant::now(), false);
+        let crate::diagnostics::LogRecord::Peer(record) = receiver.try_recv().unwrap() else {
+            panic!("peer diagnostic record required");
+        };
+        assert!(!record.terminal);
+        peer.log_snapshot(Some(&log), Instant::now(), true);
+        let crate::diagnostics::LogRecord::Peer(record) = receiver.try_recv().unwrap() else {
+            panic!("peer diagnostic record required");
+        };
+        assert!(record.terminal);
     }
     fn known_authority() -> crate::desktop::InputAuthority {
         let authority = crate::desktop::InputAuthority::default();
@@ -2748,7 +2772,7 @@ mod tests {
         let (mut peer, mut client, server, client_socket) = loopback_peer();
         let (logger, _stalled_consumer) = DiagnosticsLog::stalled();
         for _ in 0..100 {
-            peer.log_snapshot(Some(&logger), Instant::now());
+            peer.log_snapshot(Some(&logger), Instant::now(), false);
         }
         assert_eq!(logger.dropped(), 99);
         peer.queue(json!({"type":"diagnostics_probe"})).unwrap();
@@ -2761,7 +2785,7 @@ mod tests {
                 == "diagnostics_probe"
         }) {
             assert!(Instant::now() < deadline);
-            peer.log_snapshot(Some(&logger), Instant::now());
+            peer.log_snapshot(Some(&logger), Instant::now(), false);
             drive_client(&mut client, &client_socket, &mut messages, &mut opened);
             drive_peer(&mut peer, &server);
             peer.rtc
@@ -2799,11 +2823,12 @@ mod tests {
             .unwrap();
         client_outputs(&mut peer.rtc, &server, &mut Vec::new(), &mut false);
         let (log, receiver) = DiagnosticsLog::stalled();
-        peer.log_snapshot(Some(&log), Instant::now());
+        peer.log_snapshot(Some(&log), Instant::now(), false);
         let crate::diagnostics::LogRecord::Peer(record) = receiver.try_recv().unwrap() else {
             panic!("peer diagnostic record required");
         };
         assert!(record.pacer_queue.is_some());
+        let trace_id = record.trace_id;
         let generation = peer.generation;
         let readiness = peer.readiness_record(
             Instant::now(),
@@ -2813,6 +2838,7 @@ mod tests {
             generation,
         );
         assert!(readiness.pacer_queue.is_some());
+        assert_eq!(readiness.trace_id, trace_id);
         std::thread::sleep(Duration::from_millis(40));
         peer.rtc
             .handle_input(Input::Timeout(Instant::now()))
