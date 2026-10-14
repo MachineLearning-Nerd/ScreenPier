@@ -227,6 +227,27 @@ impl AllocationRecord {
 }
 
 #[derive(Serialize)]
+pub struct PacerQueueRecord {
+    pub sample_age_ms: u64,
+    pub first_unsent_age_ms: Option<u64>,
+    pub bytes: usize,
+    pub packets: usize,
+}
+
+impl PacerQueueRecord {
+    pub fn new(info: &dyn str0m::rtp::StreamTxQueueInfo, now: Instant) -> Self {
+        Self {
+            sample_age_ms: now.saturating_duration_since(info.created_at()).as_millis() as u64,
+            first_unsent_age_ms: info
+                .first_unsent()
+                .map(|first| now.saturating_duration_since(first).as_millis() as u64),
+            bytes: info.byte_size(),
+            packets: info.packet_count(),
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub struct DiagRecord {
     pub version: u8,
     pub session: u64,
@@ -248,6 +269,7 @@ pub struct DiagRecord {
     pub actor: ActorRecord,
     pub encoder: Option<EncoderRecord>,
     pub capture_to_writer_last_ms: Option<u64>,
+    pub pacer_queue: Option<PacerQueueRecord>,
     pub received_ack_frame_last_ms: Option<u64>,
     pub presented_frame_age_ms: Option<u64>,
     pub time_since_accepted_ack_ms: Option<u64>,
@@ -268,6 +290,7 @@ pub struct PeerSnapshot {
     pub actor: ActorTimings,
     pub presented_age: Option<Duration>,
     pub ack_age: Option<Duration>,
+    pub pacer_queue: Option<PacerQueueRecord>,
 }
 
 pub struct PeerDiagnostics {
@@ -385,9 +408,10 @@ impl PeerDiagnostics {
             actor,
             presented_age,
             ack_age,
+            pacer_queue,
         } = snapshot;
         DiagRecord {
-            version: 1,
+            version: 2,
             session: self.session,
             elapsed_ms: now.saturating_duration_since(self.started).as_millis() as u64,
             bitrate_kbps,
@@ -407,6 +431,7 @@ impl PeerDiagnostics {
             actor: actor.into(),
             encoder: self.encoding.map(Into::into),
             capture_to_writer_last_ms: self.capture_to_writer_last_ms,
+            pacer_queue,
             received_ack_frame_last_ms: self.received_ack_frame_last_ms,
             presented_frame_age_ms: presented_age.map(|d| d.as_millis() as u64),
             time_since_accepted_ack_ms: ack_age.map(|d| d.as_millis() as u64),
@@ -715,6 +740,39 @@ fn open_log(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct QueueInfo {
+        sampled: Instant,
+        first: Option<Instant>,
+    }
+    impl str0m::rtp::StreamTxQueueInfo for QueueInfo {
+        fn created_at(&self) -> Instant {
+            self.sampled
+        }
+        fn byte_size(&self) -> usize {
+            2048
+        }
+        fn packet_count(&self) -> usize {
+            3
+        }
+        fn first_unsent(&self) -> Option<Instant> {
+            self.first
+        }
+    }
+
+    #[test]
+    fn pacer_queue_record_distinguishes_stale_sample_from_unsent_packet_age() {
+        let now = Instant::now();
+        let info = QueueInfo {
+            sampled: now - Duration::from_millis(25),
+            first: Some(now - Duration::from_millis(180)),
+        };
+        let queue = PacerQueueRecord::new(&info, now);
+        assert_eq!(queue.sample_age_ms, 25);
+        assert_eq!(queue.first_unsent_age_ms, Some(180));
+        assert_eq!((queue.bytes, queue.packets), (2048, 3));
+    }
+
     fn known_authority() -> crate::desktop::InputAuthority {
         let authority = crate::desktop::InputAuthority::default();
         authority.observe_lock(crate::desktop::LockObservation {
@@ -759,6 +817,12 @@ mod tests {
                 },
                 presented_age: Some(Duration::from_millis(130)),
                 ack_age: Some(Duration::from_millis(10)),
+                pacer_queue: Some(PacerQueueRecord {
+                    sample_age_ms: 4,
+                    first_unsent_age_ms: Some(80),
+                    bytes: 2048,
+                    packets: 3,
+                }),
             },
         )
     }
@@ -967,11 +1031,11 @@ mod tests {
         assert_eq!(
             actual,
             json!({
-                "version":1,"session":3,"elapsed_ms":10,"bitrate_kbps":700,"fps":8,"bwe_estimate_bps":900000,"allocation":null,"encoder_starts":0,"encoder_restarts":0,"keyframe_requests":0,"encoder_kbps":null,"encoder_fps":null,"frames":6,"input_ready":false,
+                "version":2,"session":3,"elapsed_ms":10,"bitrate_kbps":700,"fps":8,"bwe_estimate_bps":900000,"allocation":null,"encoder_starts":0,"encoder_restarts":0,"keyframe_requests":0,"encoder_kbps":null,"encoder_fps":null,"frames":6,"input_ready":false,
                 "input_received":0,"input_admitted":0,"input_denied":0,
                 "actor":{"capture_last_ms":0,"capture_timeout_sync":2,"capture_timeout_constraints":3,"capture_timeout_ready":5,"capture_timeout_consecutive":1,"capture_failed_last_ms":120,"conversion_last_ms":0,"comparison_last_ms":0,"input_queue_last_ms":0,"lock_query_last_ms":0,"lock_query_sequence":0,"lock_query_outcome":0,"lock_query_counts":[0,0,0,0,0,0,0,0],"lock_observed_us":0,"lock_query_us":0,"cancellations":0,"rejected_inputs":0,"input_completed":0,"input_expired":0,"input_cancelled":0,"input_failed":0},
                 "encoder":{"capture_to_submit_last_ms":15,"capture_to_selected_last_ms":10,"raw_write_last_ms":5,"raw_accepted":4,"raw_replaced":2,"raw_contended":1,"submit_to_output_last_ms":9,"capture_to_output_last_ms":24},
-                "capture_to_writer_last_ms":null,"received_ack_frame_last_ms":120,"presented_frame_age_ms":130,"time_since_accepted_ack_ms":10,"rtc_tick_gap_max_ms":0,"due_timeout_lateness_max_ms":0,"fault":"encoder_framing","log_dropped":0,"log_failed":false
+                "capture_to_writer_last_ms":null,"pacer_queue":{"sample_age_ms":4,"first_unsent_age_ms":80,"bytes":2048,"packets":3},"received_ack_frame_last_ms":120,"presented_frame_age_ms":130,"time_since_accepted_ack_ms":10,"rtc_tick_gap_max_ms":0,"due_timeout_lateness_max_ms":0,"fault":"encoder_framing","log_dropped":0,"log_failed":false
             })
         );
         assert!(matches!(

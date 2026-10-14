@@ -1227,8 +1227,15 @@ impl Peer {
         }
         self.capture(config, socket, Instant::now(), log)
     }
-    fn log_snapshot(&self, log: Option<&DiagnosticsLog>, now: Instant) {
+    fn log_snapshot(&mut self, log: Option<&DiagnosticsLog>, now: Instant) {
         if let Some(log) = log {
+            let pacer_queue = self.mid.and_then(|mid| {
+                self.rtc
+                    .direct_api()
+                    .stream_tx_by_mid(mid, None)
+                    .and_then(|stream| stream.queue_info())
+                    .map(|info| crate::diagnostics::PacerQueueRecord::new(info, now))
+            });
             log.submit(self.diagnostics.record(
                 now,
                 PeerSnapshot {
@@ -1244,6 +1251,7 @@ impl Peer {
                     actor: self.actor_timings,
                     presented_age: self.progress.as_ref().and_then(|p| p.presented_age(now)),
                     ack_age: self.progress.as_ref().and_then(|p| p.accepted_ack_age(now)),
+                    pacer_queue,
                 },
             ));
         }
@@ -2785,6 +2793,12 @@ mod tests {
             )
             .unwrap();
         client_outputs(&mut peer.rtc, &server, &mut Vec::new(), &mut false);
+        let (log, receiver) = DiagnosticsLog::stalled();
+        peer.log_snapshot(Some(&log), Instant::now());
+        let crate::diagnostics::LogRecord::Peer(record) = receiver.try_recv().unwrap() else {
+            panic!("peer diagnostic record required");
+        };
+        assert!(record.pacer_queue.is_some());
         std::thread::sleep(Duration::from_millis(40));
         peer.rtc
             .handle_input(Input::Timeout(Instant::now()))
