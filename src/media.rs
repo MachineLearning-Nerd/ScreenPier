@@ -599,6 +599,7 @@ impl Peer {
         } else {
             reason
         };
+        let pacer_queue = self.pacer_queue(now);
         let mut record = self.diagnostics.readiness_record(
             now,
             ReadinessObservation {
@@ -611,6 +612,7 @@ impl Peer {
             },
         );
         record.heartbeat_age_us = micros(now.saturating_duration_since(self.heartbeat));
+        record.pacer_queue = pacer_queue;
         record.permit_deadline_offset_us = self
             .progress
             .as_ref()
@@ -1229,13 +1231,7 @@ impl Peer {
     }
     fn log_snapshot(&mut self, log: Option<&DiagnosticsLog>, now: Instant) {
         if let Some(log) = log {
-            let pacer_queue = self.mid.and_then(|mid| {
-                self.rtc
-                    .direct_api()
-                    .stream_tx_by_mid(mid, None)
-                    .and_then(|stream| stream.queue_info())
-                    .map(|info| crate::diagnostics::PacerQueueRecord::new(info, now))
-            });
+            let pacer_queue = self.pacer_queue(now);
             log.submit(self.diagnostics.record(
                 now,
                 PeerSnapshot {
@@ -1255,6 +1251,15 @@ impl Peer {
                 },
             ));
         }
+    }
+    fn pacer_queue(&mut self, now: Instant) -> Option<crate::diagnostics::PacerQueueRecord> {
+        self.mid.and_then(|mid| {
+            self.rtc
+                .direct_api()
+                .stream_tx_by_mid(mid, None)
+                .and_then(|stream| stream.queue_info())
+                .map(|info| crate::diagnostics::PacerQueueRecord::new(info, now))
+        })
     }
 }
 impl Drop for Peer {
@@ -2799,6 +2804,15 @@ mod tests {
             panic!("peer diagnostic record required");
         };
         assert!(record.pacer_queue.is_some());
+        let generation = peer.generation;
+        let readiness = peer.readiness_record(
+            Instant::now(),
+            ReadinessEvent::StateQueued,
+            ReadinessReason::None,
+            false,
+            generation,
+        );
+        assert!(readiness.pacer_queue.is_some());
         std::thread::sleep(Duration::from_millis(40));
         peer.rtc
             .handle_input(Input::Timeout(Instant::now()))

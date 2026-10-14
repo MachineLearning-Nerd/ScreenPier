@@ -351,7 +351,7 @@ impl PeerDiagnostics {
         } = observation;
         self.readiness_sequence = self.readiness_sequence.saturating_add(1);
         ReadinessRecord {
-            version: 1,
+            version: 2,
             session: self.session,
             sequence: self.readiness_sequence,
             elapsed_us: crate::session::micros(now.saturating_duration_since(self.started)),
@@ -370,6 +370,7 @@ impl PeerDiagnostics {
             heartbeat_age_us: 0,
             permit_deadline_offset_us: None,
             display: evidence,
+            pacer_queue: None,
             log_dropped: 0,
             log_failed: false,
         }
@@ -519,6 +520,7 @@ pub(crate) struct ReadinessRecord {
     pub heartbeat_age_us: u64,
     pub permit_deadline_offset_us: Option<i64>,
     pub display: Option<DisplayEvidence>,
+    pub pacer_queue: Option<PacerQueueRecord>,
     pub log_dropped: u64,
     pub log_failed: bool,
 }
@@ -870,13 +872,14 @@ mod tests {
         assert_eq!(
             actual,
             json!({
-                "version":1,"session":3,"sequence":1,"elapsed_us":12,"readiness_event":1,"reason":9,
+                "version":2,"session":3,"sequence":1,"elapsed_us":12,"readiness_event":1,"reason":9,
                 "ready_before":true,"ready_after":false,"authority_phase":0,"input_revision":4,
                 "authority_phase_after":null,"input_revision_after":null,"submitted_revision":null,"message_revision":null,
                 "acknowledgement_accepted":null,"generation":null,"heartbeat_age_us":0,
                 "permit_deadline_offset_us":null,
                 "display":{"generation_matches":true,"same_content":false,"capture_age_us":7,
                     "presented_capture_age_us":500001,"accepted_ack_age_us":20,"display_deadline_offset_us":-1},
+                "pacer_queue":null,
                 "log_dropped":0,"log_failed":false
             })
         );
