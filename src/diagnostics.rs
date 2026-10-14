@@ -124,6 +124,7 @@ pub struct ActorRecord {
     input_expired: u64,
     input_cancelled: u64,
     input_failed: u64,
+    last_input_expiry: Option<crate::desktop_actor::InputExpiry>,
 }
 impl From<ActorTimings> for ActorRecord {
     fn from(t: ActorTimings) -> Self {
@@ -149,6 +150,7 @@ impl From<ActorTimings> for ActorRecord {
             input_expired: t.input_expired,
             input_cancelled: t.input_cancelled,
             input_failed: t.input_failed,
+            last_input_expiry: t.last_input_expiry,
         }
     }
 }
@@ -227,10 +229,33 @@ impl AllocationRecord {
 }
 
 #[derive(Serialize)]
+pub struct PacerQueueRecord {
+    pub sample_age_ms: u64,
+    pub first_unsent_age_ms: Option<u64>,
+    pub bytes: usize,
+    pub packets: usize,
+}
+
+impl PacerQueueRecord {
+    pub fn new(info: &dyn str0m::rtp::StreamTxQueueInfo, now: Instant) -> Self {
+        Self {
+            sample_age_ms: now.saturating_duration_since(info.created_at()).as_millis() as u64,
+            first_unsent_age_ms: info
+                .first_unsent()
+                .map(|first| now.saturating_duration_since(first).as_millis() as u64),
+            bytes: info.byte_size(),
+            packets: info.packet_count(),
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub struct DiagRecord {
     pub version: u8,
     pub session: u64,
+    pub trace_id: u64,
     pub elapsed_ms: u64,
+    pub terminal: bool,
     pub bitrate_kbps: u32,
     pub fps: u32,
     pub bwe_estimate_bps: Option<u64>,
@@ -248,6 +273,7 @@ pub struct DiagRecord {
     pub actor: ActorRecord,
     pub encoder: Option<EncoderRecord>,
     pub capture_to_writer_last_ms: Option<u64>,
+    pub pacer_queue: Option<PacerQueueRecord>,
     pub received_ack_frame_last_ms: Option<u64>,
     pub presented_frame_age_ms: Option<u64>,
     pub time_since_accepted_ack_ms: Option<u64>,
@@ -268,6 +294,8 @@ pub struct PeerSnapshot {
     pub actor: ActorTimings,
     pub presented_age: Option<Duration>,
     pub ack_age: Option<Duration>,
+    pub pacer_queue: Option<PacerQueueRecord>,
+    pub terminal: bool,
 }
 
 pub struct PeerDiagnostics {
@@ -275,6 +303,7 @@ pub struct PeerDiagnostics {
     pub input_admitted: u64,
     pub input_denied: u64,
     pub session: u64,
+    trace_id: u64,
     pub encoder_starts: u64,
     pub keyframe_requests: u64,
     pub(crate) encoder_allocation: Option<crate::allocation::Allocation>,
@@ -297,6 +326,7 @@ impl PeerDiagnostics {
             input_admitted: 0,
             input_denied: 0,
             session: 0,
+            trace_id: rand::random(),
             encoder_starts: 0,
             keyframe_requests: 0,
             encoder_allocation: None,
@@ -328,8 +358,9 @@ impl PeerDiagnostics {
         } = observation;
         self.readiness_sequence = self.readiness_sequence.saturating_add(1);
         ReadinessRecord {
-            version: 1,
+            version: 3,
             session: self.session,
+            trace_id: self.trace_id,
             sequence: self.readiness_sequence,
             elapsed_us: crate::session::micros(now.saturating_duration_since(self.started)),
             readiness_event: event as u8,
@@ -347,6 +378,7 @@ impl PeerDiagnostics {
             heartbeat_age_us: 0,
             permit_deadline_offset_us: None,
             display: evidence,
+            pacer_queue: None,
             log_dropped: 0,
             log_failed: false,
         }
@@ -385,11 +417,15 @@ impl PeerDiagnostics {
             actor,
             presented_age,
             ack_age,
+            pacer_queue,
+            terminal,
         } = snapshot;
         DiagRecord {
-            version: 1,
+            version: 4,
             session: self.session,
+            trace_id: self.trace_id,
             elapsed_ms: now.saturating_duration_since(self.started).as_millis() as u64,
+            terminal,
             bitrate_kbps,
             fps,
             bwe_estimate_bps,
@@ -407,6 +443,7 @@ impl PeerDiagnostics {
             actor: actor.into(),
             encoder: self.encoding.map(Into::into),
             capture_to_writer_last_ms: self.capture_to_writer_last_ms,
+            pacer_queue,
             received_ack_frame_last_ms: self.received_ack_frame_last_ms,
             presented_frame_age_ms: presented_age.map(|d| d.as_millis() as u64),
             time_since_accepted_ack_ms: ack_age.map(|d| d.as_millis() as u64),
@@ -477,6 +514,7 @@ pub(crate) struct ReadinessObservation {
 pub(crate) struct ReadinessRecord {
     pub version: u8,
     pub session: u64,
+    pub trace_id: u64,
     pub sequence: u64,
     pub elapsed_us: u64,
     pub readiness_event: u8,
@@ -494,6 +532,7 @@ pub(crate) struct ReadinessRecord {
     pub heartbeat_age_us: u64,
     pub permit_deadline_offset_us: Option<i64>,
     pub display: Option<DisplayEvidence>,
+    pub pacer_queue: Option<PacerQueueRecord>,
     pub log_dropped: u64,
     pub log_failed: bool,
 }
@@ -715,6 +754,39 @@ fn open_log(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct QueueInfo {
+        sampled: Instant,
+        first: Option<Instant>,
+    }
+    impl str0m::rtp::StreamTxQueueInfo for QueueInfo {
+        fn created_at(&self) -> Instant {
+            self.sampled
+        }
+        fn byte_size(&self) -> usize {
+            2048
+        }
+        fn packet_count(&self) -> usize {
+            3
+        }
+        fn first_unsent(&self) -> Option<Instant> {
+            self.first
+        }
+    }
+
+    #[test]
+    fn pacer_queue_record_distinguishes_stale_sample_from_unsent_packet_age() {
+        let now = Instant::now();
+        let info = QueueInfo {
+            sampled: now - Duration::from_millis(25),
+            first: Some(now - Duration::from_millis(180)),
+        };
+        let queue = PacerQueueRecord::new(&info, now);
+        assert_eq!(queue.sample_age_ms, 25);
+        assert_eq!(queue.first_unsent_age_ms, Some(180));
+        assert_eq!((queue.bytes, queue.packets), (2048, 3));
+    }
+
     fn known_authority() -> crate::desktop::InputAuthority {
         let authority = crate::desktop::InputAuthority::default();
         authority.observe_lock(crate::desktop::LockObservation {
@@ -728,6 +800,7 @@ mod tests {
     fn record(now: Instant) -> DiagRecord {
         let mut diagnostics = PeerDiagnostics::new(now);
         diagnostics.session = 3;
+        diagnostics.trace_id = 42;
         diagnostics.received_ack_frame_last_ms = Some(120);
         diagnostics.encoding = Some(EncodingTimings {
             capture_to_submit_ms: 15,
@@ -759,6 +832,13 @@ mod tests {
                 },
                 presented_age: Some(Duration::from_millis(130)),
                 ack_age: Some(Duration::from_millis(10)),
+                pacer_queue: Some(PacerQueueRecord {
+                    sample_age_ms: 4,
+                    first_unsent_age_ms: Some(80),
+                    bytes: 2048,
+                    packets: 3,
+                }),
+                terminal: false,
             },
         )
     }
@@ -772,6 +852,7 @@ mod tests {
     fn readiness(now: Instant) -> ReadinessRecord {
         let mut diagnostics = PeerDiagnostics::new(now);
         diagnostics.session = 3;
+        diagnostics.trace_id = 42;
         diagnostics.readiness_record(
             now + Duration::from_micros(12),
             ReadinessObservation {
@@ -806,13 +887,14 @@ mod tests {
         assert_eq!(
             actual,
             json!({
-                "version":1,"session":3,"sequence":1,"elapsed_us":12,"readiness_event":1,"reason":9,
+                "version":3,"session":3,"trace_id":42,"sequence":1,"elapsed_us":12,"readiness_event":1,"reason":9,
                 "ready_before":true,"ready_after":false,"authority_phase":0,"input_revision":4,
                 "authority_phase_after":null,"input_revision_after":null,"submitted_revision":null,"message_revision":null,
                 "acknowledgement_accepted":null,"generation":null,"heartbeat_age_us":0,
                 "permit_deadline_offset_us":null,
                 "display":{"generation_matches":true,"same_content":false,"capture_age_us":7,
                     "presented_capture_age_us":500001,"accepted_ack_age_us":20,"display_deadline_offset_us":-1},
+                "pacer_queue":null,
                 "log_dropped":0,"log_failed":false
             })
         );
@@ -964,20 +1046,44 @@ mod tests {
         let bytes = serde_json::to_vec(&record(Instant::now())).unwrap();
         assert!(bytes.len() < MAX_RECORD_BYTES);
         let actual: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            actual,
-            json!({
-                "version":1,"session":3,"elapsed_ms":10,"bitrate_kbps":700,"fps":8,"bwe_estimate_bps":900000,"allocation":null,"encoder_starts":0,"encoder_restarts":0,"keyframe_requests":0,"encoder_kbps":null,"encoder_fps":null,"frames":6,"input_ready":false,
-                "input_received":0,"input_admitted":0,"input_denied":0,
-                "actor":{"capture_last_ms":0,"capture_timeout_sync":2,"capture_timeout_constraints":3,"capture_timeout_ready":5,"capture_timeout_consecutive":1,"capture_failed_last_ms":120,"conversion_last_ms":0,"comparison_last_ms":0,"input_queue_last_ms":0,"lock_query_last_ms":0,"lock_query_sequence":0,"lock_query_outcome":0,"lock_query_counts":[0,0,0,0,0,0,0,0],"lock_observed_us":0,"lock_query_us":0,"cancellations":0,"rejected_inputs":0,"input_completed":0,"input_expired":0,"input_cancelled":0,"input_failed":0},
-                "encoder":{"capture_to_submit_last_ms":15,"capture_to_selected_last_ms":10,"raw_write_last_ms":5,"raw_accepted":4,"raw_replaced":2,"raw_contended":1,"submit_to_output_last_ms":9,"capture_to_output_last_ms":24},
-                "capture_to_writer_last_ms":null,"received_ack_frame_last_ms":120,"presented_frame_age_ms":130,"time_since_accepted_ack_ms":10,"rtc_tick_gap_max_ms":0,"due_timeout_lateness_max_ms":0,"fault":"encoder_framing","log_dropped":0,"log_failed":false
-            })
-        );
+        let mut expected = json!({
+            "version":4,"session":3,"elapsed_ms":10,"terminal":false,"bitrate_kbps":700,"fps":8,"bwe_estimate_bps":900000,"allocation":null,"encoder_starts":0,"encoder_restarts":0,"keyframe_requests":0,"encoder_kbps":null,"encoder_fps":null,"frames":6,"input_ready":false,
+            "input_received":0,"input_admitted":0,"input_denied":0,
+            "actor":{"capture_last_ms":0,"capture_timeout_sync":2,"capture_timeout_constraints":3,"capture_timeout_ready":5,"capture_timeout_consecutive":1,"capture_failed_last_ms":120,"conversion_last_ms":0,"comparison_last_ms":0,"input_queue_last_ms":0,"lock_query_last_ms":0,"lock_query_sequence":0,"lock_query_outcome":0,"lock_query_counts":[0,0,0,0,0,0,0,0],"lock_observed_us":0,"lock_query_us":0,"cancellations":0,"rejected_inputs":0,"input_completed":0,"input_expired":0,"input_cancelled":0,"input_failed":0,"last_input_expiry":null},
+            "encoder":{"capture_to_submit_last_ms":15,"capture_to_selected_last_ms":10,"raw_write_last_ms":5,"raw_accepted":4,"raw_replaced":2,"raw_contended":1,"submit_to_output_last_ms":9,"capture_to_output_last_ms":24},
+            "capture_to_writer_last_ms":null,"pacer_queue":{"sample_age_ms":4,"first_unsent_age_ms":80,"bytes":2048,"packets":3},"received_ack_frame_last_ms":120,"presented_frame_age_ms":130,"time_since_accepted_ack_ms":10,"rtc_tick_gap_max_ms":0,"due_timeout_lateness_max_ms":0,"fault":"encoder_framing","log_dropped":0,"log_failed":false
+        });
+        expected["trace_id"] = json!(42);
+        assert_eq!(actual, expected);
         assert!(matches!(
             FaultReason::from_safe_reason("unknown private detail"),
             FaultReason::Operation
         ));
+    }
+    #[test]
+    fn expired_input_snapshot_records_only_kind_and_bounded_timing() {
+        use crate::desktop_actor::{InputExpiry, InputKind};
+
+        let mut snapshot = record(Instant::now());
+        snapshot.actor.last_input_expiry = Some(InputExpiry {
+            actor_session: 7,
+            kind: InputKind::Button,
+            queue_ms: 37,
+            native_ms: 483,
+            permit_remaining_at_dispatch_ms: 461,
+            permit_remaining_at_result_ms: -22,
+        });
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        assert!(bytes.len() < MAX_RECORD_BYTES);
+        let actual: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            actual["actor"]["last_input_expiry"],
+            json!({
+                "actor_session":7,"kind":"button","queue_ms":37,"native_ms":483,
+                "permit_remaining_at_dispatch_ms":461,
+                "permit_remaining_at_result_ms":-22
+            })
+        );
     }
     #[test]
     fn host_cleanup_failure_and_final_outcome_drain_before_writer_shutdown() {

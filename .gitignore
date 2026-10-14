@@ -1,2 +1,4 @@
 /target
 /.audit/
+__pycache__/
+*.pyc

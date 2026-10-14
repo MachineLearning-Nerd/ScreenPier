@@ -1,4 +1,4 @@
-use crate::desktop::InputPermit;
+use crate::desktop::{InputPermit, Viewport};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -19,6 +19,14 @@ pub enum Command {
         epoch: String,
         generation: u64,
         rtp: u32,
+        viewport_seq: Option<u64>,
+    },
+    Viewport {
+        revision: String,
+        generation: u64,
+        seq: u64,
+        x: u32,
+        y: u32,
     },
     Release {
         revision: String,
@@ -29,18 +37,23 @@ pub enum Command {
     Pointer {
         revision: String,
         generation: u64,
+        rtp: Option<u32>,
         x: f64,
         y: f64,
     },
     Key {
+        id: Option<u64>,
         revision: String,
         generation: u64,
+        rtp: Option<u32>,
         code: u32,
         down: bool,
     },
     Button {
+        id: Option<u64>,
         revision: String,
         generation: u64,
+        rtp: Option<u32>,
         x: f64,
         y: f64,
         button: u8,
@@ -49,6 +62,7 @@ pub enum Command {
     Scroll {
         revision: String,
         generation: u64,
+        rtp: Option<u32>,
         x: f64,
         y: f64,
         dx: f64,
@@ -69,6 +83,13 @@ pub struct FrameIdentity {
     pub generation: u64,
     pub content: u64,
     pub captured: Instant,
+    pub viewport: Option<ViewportFrame>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewportFrame {
+    pub seq: u64,
+    pub viewport: Viewport,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -133,6 +154,16 @@ impl DisplayProgress {
     }
 
     pub fn acknowledge(&mut self, generation: u64, timestamp: u32, now: Instant) -> bool {
+        self.acknowledge_viewport(generation, timestamp, None, now)
+    }
+
+    pub fn acknowledge_viewport(
+        &mut self,
+        generation: u64,
+        timestamp: u32,
+        viewport_seq: Option<u64>,
+        now: Instant,
+    ) -> bool {
         if generation != self.generation {
             return false;
         }
@@ -146,6 +177,7 @@ impl DisplayProgress {
             return false;
         };
         if frame.generation != generation
+            || frame.viewport.map(|viewport| viewport.seq) != viewport_seq
             || self
                 .presented
                 .is_some_and(|old| frame.captured <= old.captured)
@@ -197,6 +229,18 @@ impl DisplayProgress {
         (now < expires_at).then(|| InputPermit::new(generation, expires_at))
     }
 
+    pub fn input_permit_for_frame(
+        &self,
+        generation: u64,
+        rtp: u32,
+        heartbeat: Instant,
+        now: Instant,
+    ) -> Option<InputPermit> {
+        (self.presented?.timestamp == rtp)
+            .then(|| self.input_permit(generation, heartbeat, now))
+            .flatten()
+    }
+
     pub fn admits(&self, generation: u64, now: Instant) -> bool {
         self.input_deadline(generation)
             .is_some_and(|deadline| now < deadline)
@@ -205,6 +249,14 @@ impl DisplayProgress {
     pub fn accepted_ack_age(&self, now: Instant) -> Option<Duration> {
         self.presented_at
             .map(|at| now.saturating_duration_since(at))
+    }
+
+    pub fn acknowledged_rtp(&self) -> Option<u32> {
+        self.presented.map(|frame| frame.timestamp)
+    }
+
+    pub fn acknowledged_frame(&self) -> Option<FrameIdentity> {
+        self.presented
     }
 
     pub fn presented_age(&self, now: Instant) -> Option<Duration> {
@@ -225,13 +277,14 @@ mod tests {
             generation: 1,
             content: 1,
             captured: start,
+            viewport: None,
         });
         assert!(progress.acknowledge(1, 42, start));
         progress
     }
 
     #[test]
-    fn evidence_reports_original_deadlines_without_changing_strict_admission() {
+    fn evidence_reports_changed_content_deadline_without_changing_strict_admission() {
         let start = Instant::now();
         let mut progress = presented(start);
         progress.captured(2, start + Duration::from_millis(400));
@@ -289,6 +342,7 @@ mod tests {
             generation: 1,
             content: 1,
             captured: start + Duration::from_millis(2800),
+            viewport: None,
         });
         assert!(progress.acknowledge(1, 43, start + Duration::from_millis(2800)));
         assert!(
@@ -342,6 +396,52 @@ mod tests {
     }
 
     #[test]
+    fn input_proof_requires_the_presented_frame_and_keeps_the_changed_content_deadline() {
+        let start = Instant::now();
+        let mut progress = presented(start);
+        progress.captured(2, start + Duration::from_millis(100));
+        let before = start + Duration::from_millis(499);
+        assert!(
+            progress
+                .input_permit_for_frame(1, 42, start, before)
+                .is_some()
+        );
+        assert!(
+            progress
+                .input_permit_for_frame(1, 43, start, before)
+                .is_none()
+        );
+        assert!(
+            progress
+                .input_permit_for_frame(2, 42, start, before)
+                .is_none()
+        );
+        assert!(
+            progress
+                .input_permit_for_frame(1, 42, start, start + Duration::from_millis(500))
+                .is_none()
+        );
+        progress.sent(FrameIdentity {
+            timestamp: 43,
+            generation: 1,
+            content: 2,
+            captured: start + Duration::from_millis(100),
+            viewport: None,
+        });
+        assert!(progress.acknowledge(1, 43, before));
+        assert!(
+            progress
+                .input_permit_for_frame(1, 42, start, before)
+                .is_none()
+        );
+        assert!(
+            progress
+                .input_permit_for_frame(1, 43, start, before)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn heartbeat_bounds_the_permit_even_with_recent_static_presentations() {
         let start = Instant::now();
         let mut progress = presented(start);
@@ -352,6 +452,7 @@ mod tests {
             generation: 1,
             content: 1,
             captured: later,
+            viewport: None,
         });
         assert!(progress.acknowledge(1, 43, later));
         assert_eq!(
@@ -373,6 +474,7 @@ mod tests {
             generation: 1,
             content: 1,
             captured: start,
+            viewport: None,
         });
         assert!(!progress.admits(1, start));
         assert!(!progress.acknowledge(2, 42, start));
@@ -396,12 +498,14 @@ mod tests {
             generation: 1,
             content: 1,
             captured: start,
+            viewport: None,
         });
         p.sent(FrameIdentity {
             timestamp: 4,
             generation: 1,
             content: 2,
             captured: start + Duration::from_millis(1),
+            viewport: None,
         });
         assert!(p.acknowledge(1, 4, start));
         assert!(!p.acknowledge(1, u32::MAX, start));
@@ -410,11 +514,86 @@ mod tests {
     }
 
     #[test]
+    fn delayed_ack_from_the_old_viewport_cannot_authorize_a_reused_rtp_timestamp() {
+        let start = Instant::now();
+        let viewport = Viewport::new(0, 0, 1280, 720, 1920, 1080).unwrap();
+        let mut progress = DisplayProgress::new(1, start);
+        progress.captured(1, start);
+        progress.sent(FrameIdentity {
+            timestamp: 42,
+            generation: 1,
+            content: 1,
+            captured: start,
+            viewport: Some(ViewportFrame { seq: 1, viewport }),
+        });
+        assert!(!progress.acknowledge_viewport(1, 42, Some(0), start));
+        assert!(!progress.acknowledge(1, 42, start));
+        assert!(
+            progress
+                .input_permit_for_frame(1, 42, start, start)
+                .is_none()
+        );
+        assert!(progress.acknowledge_viewport(1, 42, Some(1), start));
+        assert!(
+            progress
+                .input_permit_for_frame(1, 42, start, start)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn viewport_command_requires_an_exact_integer_origin_and_sequence() {
+        let pan: Command = serde_json::from_str(
+            r#"{"type":"viewport","revision":"8","generation":1,"seq":2,"x":640,"y":360}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(pan, Command::Viewport { revision, generation: 1, seq: 2, x: 640, y: 360 } if revision == "8")
+        );
+        assert!(
+            serde_json::from_str::<Command>(
+                r#"{"type":"viewport","revision":"8","generation":1,"seq":2,"x":-1,"y":360}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Command>(
+                r#"{"type":"viewport","revision":"8","generation":1,"seq":2,"x":0.5,"y":360}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn malformed_commands_are_rejected() {
+        let Command::Key {
+            revision,
+            generation,
+            rtp,
+            code,
+            down,
+            ..
+        } = serde_json::from_str::<Command>(
+            r#"{"type":"key","revision":"1","generation":2,"rtp":43,"code":30,"down":true}"#,
+        )
+        .unwrap()
+        else {
+            panic!("key command required");
+        };
+        assert_eq!(
+            (revision.as_str(), generation, rtp, code, down),
+            ("1", 2, Some(43), 30, true)
+        );
         assert!(
             serde_json::from_str::<Command>(r#"{"type":"key","code":42,"down":true}"#).is_err()
         );
         assert!(serde_json::from_str::<Command>(r#"{"type":"heartbeat","extra":1}"#).is_err());
+        assert!(matches!(
+            serde_json::from_str::<Command>(
+                r#"{"type":"key","revision":"1","generation":1,"code":30,"down":true}"#
+            ),
+            Ok(Command::Key { rtp: None, .. })
+        ));
     }
     #[test]
     fn continuous_changes_and_replayed_acknowledgments_cannot_keep_stale_control_alive() {
@@ -425,12 +604,19 @@ mod tests {
             generation: 1,
             content: 1,
             captured: start,
+            viewport: None,
         });
         assert!(p.acknowledge(1, 1, start));
-        for step in 1..=10 {
-            let now = start + Duration::from_millis(step * 100);
+        for step in 1..=20 {
+            let now = start + Duration::from_millis(step * 50);
             p.captured(step + 1, now);
             assert!(!p.acknowledge(1, 1, now));
+            if step == 9 {
+                assert!(p.admits(1, start + Duration::from_millis(499)));
+            }
+            if step == 10 {
+                assert!(!p.admits(1, start + Duration::from_millis(500)));
+            }
         }
         assert!(!p.admits(1, start + Duration::from_secs(1)));
     }

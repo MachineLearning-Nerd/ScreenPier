@@ -4,7 +4,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ScreenPier</title>
 <style>
-:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10141c;color:#e7edf7}*{box-sizing:border-box}body{margin:0;display:flex;flex-direction:column;height:100dvh}header{padding:12px 18px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#192131;border-bottom:1px solid #33415a}h1{font-size:16px;margin:0 12px 0 0}button,select{background:#29374e;color:#edf3ff;border:1px solid #526784;border-radius:7px;padding:8px 12px;font:inherit}button{cursor:pointer}button:hover{background:#3b5274}button:disabled{opacity:.45;cursor:default}#connect{background:#225779}#status{font-size:14px;margin-left:auto;color:#acbdd8}#details{font-size:12px;color:#99aac3;padding:7px 18px;background:#151c28;display:flex;gap:20px;flex-wrap:wrap}label{cursor:pointer}main{flex:1;min-height:0;position:relative;background:#070a10;display:flex;align-items:center;justify-content:center;overflow:hidden}video{width:100%;height:100%;object-fit:contain;outline:none;touch-action:none}video:focus{box-shadow:inset 0 0 0 2px #558bcb}#placeholder{position:absolute;text-align:center;padding:24px;pointer-events:none;max-width:540px;color:#b1c1d8}#placeholder strong{display:block;font-size:23px;margin-bottom:12px}#notice{padding:10px 18px;min-height:39px;color:#bacbe5;background:#192131;font-size:13px}#notice.error{color:#ffb5a8}main:fullscreen{width:100vw;height:100vh}main:fullscreen video{height:100vh}main:fullscreen #placeholder{display:none}
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10141c;color:#e7edf7}*{box-sizing:border-box}body{margin:0;display:flex;flex-direction:column;height:100dvh}header{padding:12px 18px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#192131;border-bottom:1px solid #33415a}h1{font-size:16px;margin:0 12px 0 0}button,select{background:#29374e;color:#edf3ff;border:1px solid #526784;border-radius:7px;padding:8px 12px;font:inherit}button{cursor:pointer}button:hover{background:#3b5274}button:disabled{opacity:.45;cursor:default}#connect{background:#225779}#status{font-size:14px;margin-left:auto;color:#acbdd8}#details{font-size:12px;color:#99aac3;padding:7px 18px;background:#151c28;display:flex;gap:20px;flex-wrap:wrap}label{cursor:pointer}#screen-frame{flex:1;min-height:0;position:relative;display:flex}main{flex:1;min-height:0;position:relative;background:#070a10;display:flex;align-items:center;justify-content:center;overflow:hidden}video{width:100%;height:100%;object-fit:contain;outline:none;touch-action:none}video:focus{box-shadow:inset 0 0 0 2px #558bcb}#placeholder{position:absolute;text-align:center;padding:24px;pointer-events:none;max-width:540px;color:#b1c1d8}#placeholder strong{display:block;font-size:23px;margin-bottom:12px}#notice{padding:10px 18px;min-height:39px;color:#bacbe5;background:#192131;font-size:13px}#notice.error{color:#ffb5a8}#screen-frame:fullscreen{width:100vw;height:100vh}#screen-frame:fullscreen video{height:100vh}#screen-frame:fullscreen #placeholder{display:none}main.actual-size{align-items:flex-start;justify-content:flex-start;overflow:auto}main.actual-size video{width:auto;height:auto;max-width:none;max-height:none;flex:none;object-fit:fill;touch-action:auto}@media(max-width:600px){header,#details{flex-wrap:nowrap;overflow-x:auto;white-space:nowrap}#status{margin-left:0}}
+#focus-controls{position:absolute;z-index:2;top:12px;left:12px;max-width:calc(100% - 24px);display:flex;align-items:center;gap:6px;padding:7px 10px;background:#151c28e8;border:1px solid #33415a;border-radius:8px;flex-wrap:wrap}#focus-controls[hidden]{display:none}#focus-region{font-size:12px;color:#b1c1d8;margin-right:8px}
+#screen-frame:fullscreen main.actual-size video{height:auto}
 </style>
 <header>
 <h1>ScreenPier</h1>
@@ -12,19 +14,20 @@
 <button id="disconnect" disabled>Disconnect</button>
 <button id="takeover">Take control</button>
 <button id="fullscreen">Fullscreen</button>
+<button id="actual-size" title="Show one desktop pixel per CSS pixel.">Actual size</button>
 <button id="paste" disabled>Paste to Linux</button>
 <button id="copy" disabled>Copy from Linux</button>
-<label for="quality">Quality</label><select id="quality"><option value="clear">Clear text</option><option value="low_data">Low data</option><option value="smooth">Smooth motion</option></select>
+<label for="quality">Quality</label><select id="quality"><option value="clear">Clear text</option><option value="low_data">Low data</option><option value="smooth">Smooth motion</option><option value="focus">Focus view</option></select>
 <span id="status" role="status">Disconnected</span>
 </header>
-<div id="details"><span id="stream-info">Same live Linux desktop</span><label><input id="command-control" type="checkbox" checked> Mac Command sends Ctrl</label><span>US physical key mapping. Click the desktop before typing.</span></div>
-<main id="screen"><video id="video" autoplay playsinline muted tabindex="0" aria-label="Live Linux desktop"></video><div id="placeholder"><strong>Your Linux desktop, here.</strong>Connect through Tailscale to view and control the same screen on this machine. Audio is not included.</div></main>
+<div id="details"><span id="stream-info">Same live Linux desktop</span><label><input id="command-control" type="checkbox" checked> Mac Command sends Ctrl</label><label id="pan-option" hidden><input id="pan-view" type="checkbox" checked> Wheel pans view</label><span id="view-hint"></span><span>US physical key mapping. Click the desktop before typing.</span></div>
+<div id="screen-frame"><main id="screen"><video id="video" autoplay playsinline muted tabindex="0" aria-label="Live Linux desktop"></video><div id="placeholder"><strong>Your Linux desktop, here.</strong>Connect through Tailscale to view and control the same screen on this machine. Audio is not included.</div></main><div id="focus-controls" hidden><span id="focus-region" role="status">Waiting for focus view</span><button id="pan-left" aria-label="Pan left" disabled>Left</button><button id="pan-right" aria-label="Pan right" disabled>Right</button><button id="pan-up" aria-label="Pan up" disabled>Up</button><button id="pan-down" aria-label="Pan down" disabled>Down</button></div></div>
 <div id="notice" role="status">Linux must stay awake and signed in. Disconnect releases remote keys and buttons.</div>
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
 const video = $('video');
-const state = { pc:null, channel:null, lease:null, epoch:null, generation:null, ready:false, clipboardReady:false, connecting:false, serial:0, callback:null, heartbeat:null, watchdog:null, lastMessage:0, mediaProgress:null, frames:new Map(), presentations:new Map(), keys:new Map(), blocked:new Set(), buttons:new Map(), rearmPointers:new Set(), inputRevision:null, pendingClipboard:new Map(), request:0, lock:"unknown", quality:'clear', intent:false, attemptController:null, offerPending:null, retryTimer:null, retryCount:0, recoveryStarted:null, reconnecting:false };
+const state = { pc:null, channel:null, lease:null, epoch:null, generation:null, ready:false, display:null, provisional:false, localReleased:false, releasePendingRevision:null, clipboardReady:false, connecting:false, serial:0, callback:null, heartbeat:null, watchdog:null, lastMessage:0, mediaProgress:null, frames:new Map(), presentations:new Map(), keys:new Map(), blocked:new Set(), buttons:new Map(), rearmPointers:new Set(), inputRevision:null, pendingInput:new Map(), nextInputId:0, inputFailure:null, pendingClipboard:new Map(), retirements:new Map(), request:0, lock:"unknown", quality:'clear', viewportSeq:0, pendingPan:null, intent:false, attemptController:null, offerPending:null, retryTimer:null, retryCount:0, recoveryStarted:null, reconnecting:false };
 const codes = {
 Escape:1,Digit1:2,Digit2:3,Digit3:4,Digit4:5,Digit5:6,Digit6:7,Digit7:8,Digit8:9,Digit9:10,Digit0:11,Minus:12,Equal:13,Backspace:14,Tab:15,
 KeyQ:16,KeyW:17,KeyE:18,KeyR:19,KeyT:20,KeyY:21,KeyU:22,KeyI:23,KeyO:24,KeyP:25,BracketLeft:26,BracketRight:27,Enter:28,ControlLeft:29,
@@ -32,9 +35,39 @@ KeyA:30,KeyS:31,KeyD:32,KeyF:33,KeyG:34,KeyH:35,KeyJ:36,KeyK:37,KeyL:38,Semicolo
 KeyZ:44,KeyX:45,KeyC:46,KeyV:47,KeyB:48,KeyN:49,KeyM:50,Comma:51,Period:52,Slash:53,ShiftRight:54,NumpadMultiply:55,AltLeft:56,Space:57,CapsLock:58,
 F1:59,F2:60,F3:61,F4:62,F5:63,F6:64,F7:65,F8:66,F9:67,F10:68,NumLock:69,ScrollLock:70,Numpad7:71,Numpad8:72,Numpad9:73,NumpadSubtract:74,Numpad4:75,Numpad5:76,Numpad6:77,NumpadAdd:78,Numpad1:79,Numpad2:80,Numpad3:81,Numpad0:82,NumpadDecimal:83,IntlBackslash:86,F11:87,F12:88,NumpadEnter:96,ControlRight:97,NumpadDivide:98,PrintScreen:99,AltRight:100,Home:102,ArrowUp:103,PageUp:104,ArrowLeft:105,ArrowRight:106,End:107,ArrowDown:108,PageDown:109,Insert:110,Delete:111,Pause:119,MetaLeft:125,MetaRight:126,ContextMenu:127
 };
-function notice(text, error=false) { $('notice').textContent=text; $('notice').classList.toggle('error',error); }
+function notice(text, error=false) { if(state.inputFailure && text!==state.inputFailure) return; $('notice').textContent=text; $('notice').classList.toggle('error',error); }
 function status(text) { $('status').textContent=text; }
-function readiness(ready) { if(state.ready&&!ready) invalidateInput(); state.ready=ready; }
+function validViewport(viewport) {
+ if(!viewport || !['seq','x','y','width','height','full_width','full_height'].every(key=>Number.isSafeInteger(viewport[key]))) return false;
+ const {seq,x,y,width,height,full_width:fullWidth,full_height:fullHeight}=viewport;
+ return seq>=0 && x>=0 && y>=0 && width>0 && height>0 && fullWidth>=width && fullHeight>=height && x<=fullWidth-width && y<=fullHeight-height;
+}
+function validFocusFrame(frame) {return validViewport(frame.viewport) && frame.width===frame.viewport.width && frame.height===frame.viewport.height;}
+function invalidFocusView() {disconnect('Invalid focus view');notice('The host sent invalid focus-view geometry. Reconnect to try again.',true);}
+function focusControls() {
+ const focus=state.quality==='focus', viewport=state.display?.viewport;
+ $('focus-controls').hidden=!focus;
+ if(!focus) return;
+ $('focus-region').textContent=state.pendingPan?'Moving focus view…':viewport?`Focus view at ${viewport.x}, ${viewport.y} · ${viewport.width}×${viewport.height} of ${viewport.full_width}×${viewport.full_height}`:'Waiting for focus view';
+ const available=viewport && !state.pendingPan && state.inputRevision!==null && state.generation===state.display.generation && ['locked','unlocked'].includes(state.lock) && state.channel?.readyState==='open';
+ $('pan-left').disabled=!available||viewport.x===0;
+ $('pan-right').disabled=!available||viewport.x===viewport.full_width-viewport.width;
+ $('pan-up').disabled=!available||viewport.y===0;
+ $('pan-down').disabled=!available||viewport.y===viewport.full_height-viewport.height;
+}
+function readiness(ready) {
+ if(!ready&&(state.ready||state.provisional)) {
+  const releaseProvisional=!state.ready&&state.provisional&&(state.keys.size||state.buttons.size);
+  invalidateInput();
+  if(releaseProvisional&&state.inputRevision!==null) {
+   if(send({type:'release',revision:state.inputRevision})) state.releasePendingRevision=state.inputRevision;
+   else if(state.lease) recover('Control stalled');
+  }
+ }
+ state.ready=ready;
+ if(ready && !state.inputFailure) state.localReleased=false; else if(!ready) state.provisional=false;
+ focusControls();
+}
 function clipboardReadiness(ready) {state.clipboardReady=ready; $('paste').disabled=!ready; $('copy').disabled=!ready;}
 async function api(path, body, timeout=10000) {
  const controller=new AbortController();
@@ -47,12 +80,23 @@ async function api(path, body, timeout=10000) {
   }
   return response.status===204 ? null : response.json();
  })();
- request.then(answer=>{if(expired && path==='/api/offer' && answer?.lease) stopLease(answer.lease);},()=>{});
+ request.then(answer=>{if(expired && path==='/api/offer' && answer?.lease) stopLease(answer.lease).catch(()=>{});},()=>{});
  try {
   return await Promise.race([request,new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;controller.abort();reject(new Error('Request timed out'));},timeout);})]);
  } finally {clearTimeout(timer);}
 }
-function stopLease(lease) { return lease ? api('/api/stop',{lease},1000).catch(()=>{}) : Promise.resolve(); }
+function stopLease(lease) {
+ if(!lease) return Promise.resolve();
+ if(!state.retirements.has(lease)) state.retirements.set(lease,null);
+ const pending=state.retirements.get(lease);
+ if(pending) return pending;
+ const request=api('/api/stop',{lease},1000).then(
+  ()=>{state.retirements.delete(lease);},
+  error=>{if(error.status===409) state.retirements.delete(lease);else {state.retirements.set(lease,null);throw error;}}
+ );
+ state.retirements.set(lease,request);
+ return request;
+}
 function send(message) {
  const channel=state.channel;
  if (!channel || channel.readyState!=='open' || channel.bufferedAmount>32*1024) return false;
@@ -63,14 +107,97 @@ function transition(message) {
  notice('The control channel stalled. Disconnecting to release Linux input.',true);
  recover('Control stalled'); return false;
 }
+function inputProof() {
+ const frame=state.display;
+ if(!frame || state.inputFailure || state.pendingPan || state.localReleased || !(state.ready||state.provisional) || !['unlocked','locked'].includes(state.lock) || state.inputRevision===null || frame.generation!==state.generation || state.quality==='focus'&&(!validViewport(frame.viewport) || frame.viewport.seq!==state.viewportSeq || frame.viewport.width!==video.videoWidth || frame.viewport.height!==video.videoHeight)) return null;
+ return {revision:state.inputRevision,generation:frame.generation,rtp:frame.rtp};
+}
+function inputFailure(reason) {
+ if(state.inputFailure) return;
+ if(state.pendingInput.size) reason+=' Other unconfirmed keys or clicks have unknown outcomes.';
+ state.inputFailure=reason;
+ for(const pending of state.pendingInput.values()) clearTimeout(pending);
+ state.pendingInput.clear();
+ release();
+ status('Control paused');
+ notice(reason,true);
+}
+function inputResult(message) {
+ if(!Number.isSafeInteger(message.id) || message.id<1 || !state.pendingInput.has(message.id)) return;
+ clearTimeout(state.pendingInput.get(message.id));
+ state.pendingInput.delete(message.id);
+ if(message.status==='applied') return;
+ const reason=message.status==='rejected'?'Linux rejected a key or click.':message.status==='aborted'?'Linux cancelled a key or click.':'The result of a key or click is unknown.';
+ inputFailure(reason+' Control released; reconnect before typing again.');
+}
+function inputTransition(message) {
+ const proof=inputProof();
+ if(!proof) return false;
+ if(message.type!=='key' && message.type!=='button') return transition({...message,...proof});
+ if(state.pendingInput.size>=64 || state.nextInputId>=Number.MAX_SAFE_INTEGER) {
+  inputFailure('Too many unconfirmed keys or clicks. Control released; reconnect before typing again.');
+  return false;
+ }
+ const id=++state.nextInputId;
+ if(!send({...message,...proof,id})) {
+  notice('The control channel stalled. Disconnecting to release Linux input.',true);
+  recover('Control stalled'); return false;
+ }
+ const timer=setTimeout(()=>{state.pendingInput.delete(id);inputFailure('A key or click was not confirmed by Linux. Control released; reconnect before typing again.');},5000);
+ state.pendingInput.set(id,timer);
+ return true;
+}
 function trim(map) { while(map.size>180) map.delete(map.keys().next().value); }
+function newerRtp(current, previous) {
+ return Number.isInteger(current) && current>=0 && current<=0xffffffff && Number.isInteger(previous) && previous>=0 && previous<=0xffffffff && current!==previous && ((current-previous)>>>0)<0x80000000;
+}
+function finishPan() {
+ const pending=state.pendingPan;
+ if(!pending || pending.stage!=='sent' || !pending.frameSeen || !pending.revisionSeen || state.display?.viewport?.seq!==pending.seq) return;
+ clearTimeout(pending.timer); state.pendingPan=null; if(!state.inputFailure) state.localReleased=false; state.provisional=true;
+ notice('Focus view moved. Click the desktop to control Linux.');
+ focusControls();
+}
+function sendPan(pending) {
+ if(state.pendingPan!==pending || state.inputRevision===null) return;
+ const revision=state.inputRevision;
+ pending.stage='sent'; pending.baseRevision=revision;
+ if(!transition({type:'viewport',revision,generation:state.generation,seq:pending.seq,x:pending.x,y:pending.y})) return;
+ focusControls();
+}
+function pan(direction) {
+ const viewport=state.display?.viewport;
+ if(state.quality!=='focus' || state.pendingPan || !validViewport(viewport) || state.inputRevision===null || state.generation!==state.display.generation || !['unlocked','locked'].includes(state.lock)) return;
+ const stepX=Math.max(1,Math.floor(viewport.width/2)), stepY=Math.max(1,Math.floor(viewport.height/2));
+ const x=Math.max(0,Math.min(viewport.full_width-viewport.width,viewport.x+(direction==='left'?-stepX:direction==='right'?stepX:0)));
+ const y=Math.max(0,Math.min(viewport.full_height-viewport.height,viewport.y+(direction==='up'?-stepY:direction==='down'?stepY:0)));
+ if(x===viewport.x && y===viewport.y) return;
+ if(state.viewportSeq>=Number.MAX_SAFE_INTEGER) {recover('Focus view sequence exhausted');return;}
+ const pending={seq:++state.viewportSeq,x,y,stage:state.releasePendingRevision!==null?'waiting_revision':'sent',baseRevision:state.inputRevision,frameSeen:false,revisionSeen:false,timer:null};
+ pending.timer=setTimeout(()=>{if(state.pendingPan===pending) recover('Focus view did not update');},5000);
+ state.pendingPan=pending;
+ invalidateInput(); state.ready=false; state.provisional=false; state.localReleased=true;
+ focusControls();
+ if(pending.stage==='sent') sendPan(pending);
+}
 function acknowledge(rtp) {
  const frame=state.frames.get(rtp), presentation=state.presentations.get(rtp);
  if (!frame || !presentation || frame.epoch!==state.epoch) return;
- if(send({type:'presented',epoch:frame.epoch,generation:frame.generation,rtp})) {
+ if(state.mediaProgress.lastMatchedAt!==null && presentation.at<state.mediaProgress.lastMatchedAt) {state.frames.delete(rtp);state.presentations.delete(rtp);return;}
+ if(state.quality==='focus') {
+  if(!validFocusFrame(frame)) {invalidFocusView();return;}
+  const pending=state.pendingPan;
+  if(pending ? pending.stage!=='sent' || frame.viewport.seq!==pending.seq || frame.viewport.x!==pending.x || frame.viewport.y!==pending.y : frame.viewport.seq!==(state.display?.viewport?.seq??0)) {
+   state.frames.delete(rtp); state.presentations.delete(rtp); return;
+  }
+ }
+ const ack={type:'presented',epoch:frame.epoch,generation:frame.generation,rtp,...(state.quality==='focus'?{viewport_seq:frame.viewport.seq}:{})};
+ if(send(ack)) {
   if(state.generation!==frame.generation) clipboardReadiness(false);
   state.mediaProgress.lastMatchedAt=Math.max(state.mediaProgress.lastMatchedAt??-Infinity,presentation.at);
-  state.generation=frame.generation; state.frames.delete(rtp); state.presentations.delete(rtp); presentationReady();
+  state.generation=frame.generation; state.display={generation:frame.generation,rtp,...(state.quality==='focus'?{viewport:frame.viewport}:{})}; state.provisional=true; state.frames.delete(rtp); state.presentations.delete(rtp); presentationReady();
+  if(state.pendingPan) {state.pendingPan.frameSeen=true;finishPan();}
+  focusControls();
  }
 }
 function watchVideo(serial) {
@@ -94,12 +221,20 @@ function invalidateInput() {
 }
 function release() {
  const revision=state.inputRevision;
- invalidateInput(); readiness(false);
- if(revision!==null&&!send({type:'release',revision})&&state.lease) recover('Control stalled');
+ invalidateInput(); readiness(false); state.localReleased=true;
+ if(revision!==null) {
+  if(send({type:'release',revision})) state.releasePendingRevision=revision;
+  else if(state.lease) recover('Control stalled');
+ }
+ focusControls();
 }
 function clearSession(reason) {
  const lease=state.lease;
  ++state.serial;
+ for(const pending of state.pendingInput.values()) clearTimeout(pending);
+ state.pendingInput.clear(); state.nextInputId=0; state.inputFailure=null;
+ if(state.pendingPan) clearTimeout(state.pendingPan.timer);
+ state.pendingPan=null; state.viewportSeq=0;
  if(state.attemptController) state.attemptController.abort();
  state.attemptController=null;
  invalidateInput(); readiness(false); clipboardReadiness(false); if(state.inputRevision!==null) send({type:'release',revision:state.inputRevision});
@@ -108,12 +243,13 @@ function clearSession(reason) {
  state.callback=null;
  if(state.channel) state.channel.close();
  if(state.pc) state.pc.close();
- state.pc=null; state.channel=null; state.lease=null; state.epoch=null; state.generation=null; state.inputRevision=null; state.mediaProgress=null; state.lock='unknown'; state.connecting=false;
+ state.pc=null; state.channel=null; state.lease=null; state.epoch=null; state.generation=null; state.display=null; state.provisional=false; state.localReleased=false; state.releasePendingRevision=null; state.inputRevision=null; state.mediaProgress=null; state.lock='unknown'; state.connecting=false;
  video.srcObject=null; state.frames.clear(); state.presentations.clear(); $('placeholder').hidden=false;
  for(const pending of state.pendingClipboard.values()) pending.reject(new Error('Disconnected'));
  state.pendingClipboard.clear();
  $('connect').disabled=false; $('disconnect').disabled=true; status(reason);
- return stopLease(lease);
+ focusControls();
+ return stopLease(lease).catch(()=>{});
 }
 function disconnect(reason='Disconnected') {
  state.intent=false; state.reconnecting=false;
@@ -122,6 +258,12 @@ function disconnect(reason='Disconnected') {
 }
 function recover(reason) {
  if(!state.intent) return;
+ const failure=state.inputFailure|| (state.pendingInput.size?'The connection changed before Linux confirmed every key or click. Their outcome is unknown. Control released; use Connect before typing again.':null);
+ if(failure) {
+  disconnect('Control paused');
+  notice(failure,true);
+  return;
+ }
  if(reason==='The desktop video stopped' || reason==='The first desktop frame did not arrive' || reason==='Smooth mode is falling behind') {
   if(state.quality==='smooth') state.quality='clear';
   else if(state.quality==='clear' && state.retryCount>=1) state.quality='low_data';
@@ -191,6 +333,8 @@ async function attempt(takeover,automatic=false) {
  } finally {clearTimeout(timer);if(state.attemptController===controller) state.attemptController=null;}
 }
 async function establish(serial,takeover,signal) {
+ if(state.offerPending) {await state.offerPending.catch(()=>{});requireCurrent(serial);}
+ await Promise.all([...state.retirements.keys()].map(stopLease));requireCurrent(serial);
  const pc=new RTCPeerConnection({iceServers:[],bundlePolicy:'max-bundle'}); state.pc=pc;
  const transceiver=pc.addTransceiver('video',{direction:'recvonly'});
  if('jitterBufferTarget' in transceiver.receiver) transceiver.receiver.jitterBufferTarget=0;
@@ -206,22 +350,47 @@ async function establish(serial,takeover,signal) {
   if(!current(serial)) return;
   let message; try {message=JSON.parse(event.data);} catch {return;}
   state.lastMessage=performance.now();
-  if(message.type==='hello') {if(message.epoch!==state.epoch) {disconnect('Invalid session');return;}state.inputRevision=message.input_revision;status('Waiting for current display');}
-  if(message.type==='frame' && message.epoch===state.epoch) {state.frames.set(message.rtp,message);trim(state.frames);acknowledge(message.rtp);presentationReady();}
+  if(message.type==='hello') {if(message.epoch!==state.epoch) {disconnect('Invalid session');return;}state.inputRevision=message.input_revision;status('Waiting for current display');focusControls();}
+  if(message.type==='frame' && message.epoch===state.epoch) {
+   if(state.quality==='focus' && !validFocusFrame(message)) {invalidFocusView();return;}
+   state.frames.set(message.rtp,message);trim(state.frames);acknowledge(message.rtp);presentationReady();
+  }
   if(message.type==='input_reset' && /^\d+$/.test(message.revision) && (state.inputRevision===null||BigInt(message.revision)>BigInt(state.inputRevision))) {
    invalidateInput(); readiness(false); state.inputRevision=message.revision;
+   if(state.releasePendingRevision!==null && BigInt(message.revision)>BigInt(state.releasePendingRevision)) state.releasePendingRevision=null;
    transition({type:'input_reset_ack',revision:message.revision});
-   notice(state.blocked.size?'Release held keys before continuing, or click without modifiers to resume.':'Control paused while the current display catches up.');
+   const pending=state.pendingPan;
+   if(pending && BigInt(message.revision)>BigInt(pending.baseRevision)) {
+    if(pending.stage==='waiting_revision') sendPan(pending);
+    else {pending.revisionSeen=true;finishPan();}
+   }
+   if(state.pendingPan) notice('Moving focus view. Control resumes when the new view is ready.');
+   else if(!state.provisional) notice(state.blocked.size?'Release held keys before continuing, or click without modifiers to resume.':'Control paused while the current display catches up.');
+   focusControls();
   }
+  if(message.type==='state' && /^\d+$/.test(message.input_revision) && state.inputRevision!==null && BigInt(message.input_revision)>BigInt(state.inputRevision)) {readiness(false);clipboardReadiness(false);}
   if(message.type==='state' && message.input_revision===state.inputRevision) {
+   if(state.lock!=='unknown' && message.lock!==state.lock) {readiness(false);clipboardReadiness(false);state.lock=message.lock;presentationReady();return;}
+   if(message.ready===false && state.provisional && state.display?.generation===message.generation && (message.ack_rtp===null || newerRtp(state.display.rtp,message.ack_rtp))) {
+    if(state.lock==='unknown' && ['unlocked','locked'].includes(message.lock)) state.lock=message.lock;
+    if(state.lock===message.lock && state.lock!=='unknown') {
+     clipboardReadiness(message.clipboard_ready===true&&message.lock==='unlocked');
+     status(state.inputFailure?'Control paused':'Connected');
+     if(Number.isInteger(message.bitrate_kbps)&&Number.isInteger(message.fps)) $('stream-info').textContent=`${message.bitrate_kbps} kbps budget · ${message.fps} fps capture · ${message.lock}`;
+     return;
+    }
+   }
    if(state.mediaProgress) {
     if(message.ready===true) state.mediaProgress.pausedSince=null;
     else if(state.mediaProgress.pausedSince===null) state.mediaProgress.pausedSince=performance.now();
    }
-   state.lock=message.lock; clipboardReadiness(message.clipboard_ready===true&&message.lock==='unlocked'&&message.generation===state.generation); readiness(message.ready); presentationReady();
-   status(message.ready?'Connected':message.lock==='unknown'?'Desktop unavailable':'Waiting for current display');
+   state.lock=message.lock; clipboardReadiness(message.clipboard_ready===true&&message.lock==='unlocked'&&message.generation===state.generation); readiness(message.ready===true&&message.generation===state.generation); presentationReady();
+   status(state.inputFailure?'Control paused':state.pendingPan?'Moving focus view':message.ready?'Connected':message.lock==='unknown'?'Desktop unavailable':'Waiting for current display');
    $('stream-info').textContent=`${message.bitrate_kbps} kbps budget · ${message.fps} fps capture · ${message.lock}`;
+   focusControls();
   }
+  if(message.type==='viewport_rejected' && state.pendingPan?.seq===message.seq) {recover('Focus view change was rejected');return;}
+  if(message.type==='input_result') inputResult(message);
   if(message.type==='clipboard') {const pending=state.pendingClipboard.get(message.request);if(pending) {state.pendingClipboard.delete(message.request);message.ok?pending.resolve(message.text):pending.reject(new Error(message.error||'Linux clipboard is unavailable or locked'));}}
   if(message.type==='reset') recover(message.reason||'Desktop changed');
  };
@@ -231,10 +400,9 @@ async function establish(serial,takeover,signal) {
  const offer=await pc.createOffer(); requireCurrent(serial);
  await pc.setLocalDescription(offer); requireCurrent(serial);
  await iceComplete(pc,signal); requireCurrent(serial);
- if(state.offerPending) {await state.offerPending.catch(()=>{});requireCurrent(serial);}
  const response=api('/api/offer',{sdp:pc.localDescription.sdp,takeover,quality:state.quality});
  state.offerPending=response;
- response.then(answer=>{if(state.offerPending===response) state.offerPending=null;if(!current(serial)) stopLease(answer.lease);},()=>{if(state.offerPending===response) state.offerPending=null;});
+ response.then(answer=>{if(state.offerPending===response) state.offerPending=null;if(!current(serial)) stopLease(answer.lease).catch(()=>{});},()=>{if(state.offerPending===response) state.offerPending=null;});
  const answer=await response; requireCurrent(serial);
  state.lease=answer.lease; state.epoch=answer.epoch;
  const startedAt=performance.now();
@@ -272,24 +440,26 @@ function keyUp(code) {
  const remote=state.keys.get(code);
  if(remote===undefined) return;
  state.keys.delete(code);
- if(![...state.keys.values()].includes(remote)) transition({type:'key',revision:state.inputRevision,generation:state.generation,code:remote,down:false});
+ if(![...state.keys.values()].includes(remote) && !inputTransition({type:'key',code:remote,down:false})) release();
 }
 video.addEventListener('pointermove',event=>{
- if(!state.ready||state.blocked.size||!modifiersKnown(event)) return;
+ if(event.pointerType==='touch'&&$('screen').classList.contains('actual-size')) return;
+ if(!inputProof()||state.blocked.size||!modifiersKnown(event)) return;
  pointer=position(event);
  if(!pointerScheduled) {
   const serial=state.serial,revision=pointerRevision; pointerScheduled=true;
   requestAnimationFrame(()=>{
    if(revision!==pointerRevision) return;
    pointerScheduled=false;
-   if(pointer&&state.ready&&serial===state.serial) send({type:'pointer',revision:state.inputRevision,...pointer});
+   if(pointer&&serial===state.serial) {const proof=inputProof();if(proof) send({type:'pointer',...pointer,...proof});}
    pointer=null;
   });
  }
 });
 function releaseCapture(id) {if(video.hasPointerCapture(id)) video.releasePointerCapture(id);}
 video.addEventListener('pointerdown',event=>{
- if(!state.ready) return;
+ if(event.pointerType==='touch'&&$('screen').classList.contains('actual-size')) return;
+ if(!inputProof()) return;
  const p=position(event); if(!p) return;
  event.preventDefault();video.focus();
  if((state.blocked.size&&(event.shiftKey||event.ctrlKey||event.altKey||event.metaKey)) || !modifiersKnown(event)) {notice('Release held modifiers before continuing.',true);return;}
@@ -297,16 +467,17 @@ video.addEventListener('pointerdown',event=>{
  if(state.blocked.size) {
   state.blocked.clear(); state.rearmPointers.add(event.pointerId); notice('Control resumed.'); return;
  }
- if(transition({type:'button',revision:state.inputRevision,...p,button:event.button,down:true})) state.buttons.set(event.pointerId,event.button);
+ if(inputTransition({type:'button',...p,button:event.button,down:true})) state.buttons.set(event.pointerId,event.button);
  else releaseCapture(event.pointerId);
 });
 video.addEventListener('pointerup',event=>{
+ if(event.pointerType==='touch'&&$('screen').classList.contains('actual-size')) return;
  event.preventDefault();
  if(state.rearmPointers.delete(event.pointerId)) {releaseCapture(event.pointerId);return;}
  const button=state.buttons.get(event.pointerId); state.buttons.delete(event.pointerId);
  const p=position(event);
  if(button!==undefined) {
-  if(state.ready&&p) transition({type:'button',revision:state.inputRevision,...p,button,down:false}); else release();
+  if(p) {if(!inputTransition({type:'button',...p,button,down:false})) release();} else release();
  }
  releaseCapture(event.pointerId);
 });
@@ -320,19 +491,20 @@ video.addEventListener('pointercancel',cancelPointer);
 video.addEventListener('lostpointercapture',cancelPointer);
 video.addEventListener('contextmenu',event=>event.preventDefault());
 video.addEventListener('wheel',event=>{
- if(!state.ready||state.blocked.size||!modifiersKnown(event)) return;
+ if($('screen').classList.contains('actual-size')&&$('pan-view').checked) return;
+ if(!inputProof()||state.blocked.size||!modifiersKnown(event)) return;
  const p=position(event);if(!p)return;
  event.preventDefault(); const factor=event.deltaMode===1?16:event.deltaMode===2?video.clientHeight:1;
- transition({type:'scroll',revision:state.inputRevision,...p,dx:Math.max(-10000,Math.min(10000,event.deltaX*factor/10)),dy:Math.max(-10000,Math.min(10000,event.deltaY*factor/10))});
+ inputTransition({type:'scroll',...p,dx:Math.max(-10000,Math.min(10000,event.deltaX*factor/10)),dy:Math.max(-10000,Math.min(10000,event.deltaY*factor/10))});
 },{passive:false});
 video.addEventListener('keydown',event=>{
- if(!state.ready) return;
+ if(!inputProof()) return;
  event.preventDefault(); if(event.repeat||state.keys.has(event.code))return;
  if(state.blocked.size||!modifiersKnown(event,event.code)) {notice('Release held keys before continuing, or click without modifiers to resume.',true);return;}
  let code=codes[event.code];
  if($('command-control').checked&&(event.code==='MetaLeft'||event.code==='MetaRight')) code=event.code==='MetaLeft'?29:97;
  if(!code) {notice('This physical key is not mapped.',true);return;}
- if([...state.keys.values()].includes(code)||transition({type:'key',revision:state.inputRevision,generation:state.generation,code,down:true})) state.keys.set(event.code,code);
+ if([...state.keys.values()].includes(code)||inputTransition({type:'key',code,down:true})) state.keys.set(event.code,code);
 });
 video.addEventListener('keyup',event=>{
  if(state.blocked.delete(event.code)) {event.preventDefault();return;}
@@ -369,9 +541,16 @@ $('quality').onchange=()=>{
  const quality=$('quality').value;
  if(quality===state.quality) return;
  state.quality=quality;
+ focusControls();
  if(state.intent) {state.recoveryStarted=performance.now();state.retryCount=0;recover('Quality changed');}
 };
-$('fullscreen').onclick=async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await $('screen').requestFullscreen();video.focus();}catch{notice('Fullscreen was denied by the browser.',true);}};
+$('fullscreen').onclick=async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await $('screen-frame').requestFullscreen();video.focus();}catch{notice('Fullscreen was denied by the browser.',true);}};
+$('actual-size').onclick=()=>{const actual=$('screen').classList.toggle('actual-size');$('actual-size').textContent=actual?'Fit screen':'Actual size';$('actual-size').title=actual?'Fit the Linux image in the browser window.':'Show one desktop pixel per CSS pixel.';$('pan-option').hidden=!actual;$('view-hint').textContent=actual?'Wheel and touch pan the image; uncheck to scroll Linux. Fit screen for touch control.':'';};
+for(const direction of ['left','right','up','down']) {
+ const button=$('pan-'+direction);
+ button.addEventListener('pointerdown',event=>event.preventDefault());
+ button.onclick=()=>pan(direction);
+}
 function clipboardSession() {return {serial:state.serial,lease:state.lease,generation:state.generation};}
 function clipboardCurrent(session) {return session.serial===state.serial && session.lease!==null && session.lease===state.lease && session.generation!==null && session.generation===state.generation && state.clipboardReady && state.lock==='unlocked';}
 function requireClipboard(session) {if(!clipboardCurrent(session)) throw new Error('Clipboard session changed');}

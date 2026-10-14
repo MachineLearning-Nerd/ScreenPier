@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
@@ -21,6 +22,109 @@ pub enum InputAction {
     Pointer(Position),
     Button(Position, Button, Transition),
     Axis(Position, f64, f64),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputKind {
+    Key,
+    Pointer,
+    Button,
+    Axis,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputOutcome {
+    Applied,
+    Rejected,
+    Aborted,
+    Unknown,
+}
+struct InputReceipt {
+    sender: Option<Sender<InputOutcome>>,
+    began: bool,
+}
+impl InputReceipt {
+    fn new(sender: Option<Sender<InputOutcome>>) -> Self {
+        Self {
+            sender,
+            began: false,
+        }
+    }
+    fn complete(&mut self, result: &desktop::Result<()>) {
+        if let Some(sender) = self.sender.take() {
+            let outcome = if result.is_ok() {
+                InputOutcome::Applied
+            } else if self.began {
+                InputOutcome::Unknown
+            } else {
+                InputOutcome::Aborted
+            };
+            let _ = sender.send(outcome);
+        }
+    }
+}
+impl Drop for InputReceipt {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(if self.began {
+                InputOutcome::Unknown
+            } else {
+                InputOutcome::Aborted
+            });
+        }
+    }
+}
+impl InputAction {
+    fn kind(&self) -> InputKind {
+        match self {
+            Self::Key(_, _) => InputKind::Key,
+            Self::Pointer(_) => InputKind::Pointer,
+            Self::Button(_, _, _) => InputKind::Button,
+            Self::Axis(_, _, _) => InputKind::Axis,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct InputExpiry {
+    pub actor_session: u64,
+    pub kind: InputKind,
+    pub queue_ms: u64,
+    pub native_ms: u64,
+    pub permit_remaining_at_dispatch_ms: i64,
+    pub permit_remaining_at_result_ms: i64,
+}
+struct InputAttempt {
+    actor_session: u64,
+    kind: InputKind,
+    queued: Instant,
+    began: Instant,
+    permit_expires: Instant,
+    receipt: InputReceipt,
+}
+impl InputAttempt {
+    fn expiry(&self, at: Instant) -> InputExpiry {
+        InputExpiry {
+            actor_session: self.actor_session,
+            kind: self.kind,
+            queue_ms: elapsed_ms(self.queued, self.began),
+            native_ms: elapsed_ms(self.began, at),
+            permit_remaining_at_dispatch_ms: deadline_delta_ms(self.permit_expires, self.began),
+            permit_remaining_at_result_ms: deadline_delta_ms(self.permit_expires, at),
+        }
+    }
+}
+fn elapsed_ms(from: Instant, to: Instant) -> u64 {
+    to.saturating_duration_since(from)
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+fn deadline_delta_ms(deadline: Instant, at: Instant) -> i64 {
+    let remaining = if deadline >= at {
+        deadline.duration_since(at).as_millis() as i128
+    } else {
+        -(at.duration_since(deadline).as_millis() as i128)
+    };
+    remaining.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 pub struct CapturedFrame {
     pub width: u32,
@@ -53,6 +157,7 @@ pub struct ActorTimings {
     pub input_expired: u64,
     pub input_cancelled: u64,
     pub input_failed: u64,
+    pub last_input_expiry: Option<InputExpiry>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,7 +241,7 @@ struct Activation {
     wake: bool,
 }
 enum Operation {
-    Input(InputAction, InputPermit),
+    Input(InputAction, InputPermit, InputReceipt),
     ClipboardRead(u32, ClipboardGuard),
     ClipboardWrite(u32, String, ClipboardGuard),
 }
@@ -285,10 +390,27 @@ impl DesktopSession {
         permit.authorized_by_revision(&self.authority, revision)
     }
     pub fn input(&self, action: InputAction, permit: InputPermit) -> desktop::Result<()> {
+        self.input_with_receipt(action, permit, None)
+    }
+    pub fn input_tracked(
+        &self,
+        action: InputAction,
+        permit: InputPermit,
+    ) -> desktop::Result<Receiver<InputOutcome>> {
+        let (sender, receiver) = mpsc::channel();
+        self.input_with_receipt(action, permit, Some(sender))?;
+        Ok(receiver)
+    }
+    fn input_with_receipt(
+        &self,
+        action: InputAction,
+        permit: InputPermit,
+        sender: Option<Sender<InputOutcome>>,
+    ) -> desktop::Result<()> {
         if !permit.current_for(&self.authority) {
             return Err(DesktopError::Cancelled);
         }
-        self.submit(Operation::Input(action, permit))
+        self.submit(Operation::Input(action, permit, InputReceipt::new(sender)))
     }
     pub fn clipboard_read(&self, request: u32) -> desktop::Result<()> {
         self.submit(Operation::ClipboardRead(
@@ -352,7 +474,7 @@ impl DesktopSession {
         {
             mailbox
                 .commands
-                .retain(|command| !matches!(command.operation, Operation::Input(_, _)));
+                .retain(|command| !matches!(command.operation, Operation::Input(_, _, _)));
             if !mailbox.release {
                 mailbox.release = true;
                 self.shared.cancellation.fetch_add(1, Ordering::AcqRel);
@@ -496,7 +618,7 @@ fn actor_loop<B: Backend>(
     log: Option<&crate::diagnostics::DiagnosticsLog>,
 ) {
     let mut desktop: Option<B> = None;
-    let mut input_pending = false;
+    let mut input_pending: Option<InputAttempt> = None;
     let mut session = 0;
     let mut invalid = false;
     let mut previous: Option<Arc<[u8]>> = None;
@@ -519,7 +641,7 @@ fn actor_loop<B: Backend>(
         if release {
             if let Some(desktop) = desktop.as_mut() {
                 desktop.abort_input();
-                input_pending = false;
+                input_pending = None;
                 desktop.abort_capture();
             }
             capture_started = None;
@@ -589,7 +711,7 @@ fn actor_loop<B: Backend>(
         if session != active.id {
             if let Some(desktop) = desktop.as_mut() {
                 desktop.abort_input();
-                input_pending = false;
+                input_pending = None;
                 desktop.abort_capture();
             }
             capture_started = None;
@@ -715,7 +837,7 @@ fn actor_loop<B: Backend>(
                             ok: false,
                             guard: guard.clone(),
                         }),
-                        Operation::Input(_, _) => None,
+                        Operation::Input(_, _, _) => None,
                     });
                 if let Some((_, reply)) = mailbox.clipboard.as_mut() {
                     reply.text = None;
@@ -736,7 +858,7 @@ fn actor_loop<B: Backend>(
             if input_began.elapsed() >= Duration::from_millis(8) || cancellation.check().is_err() {
                 break;
             }
-            let pending_result = if input_pending {
+            let pending_result = if input_pending.is_some() {
                 match desktop.poll_input() {
                     Ok(desktop::InputPoll::Pending) => break,
                     Ok(desktop::InputPoll::Complete) => Some(Ok(())),
@@ -754,8 +876,8 @@ fn actor_loop<B: Backend>(
                 break;
             }
             let result = if let Some(result) = pending_result {
-                input_pending = false;
-                record_input_result(shared, &result);
+                let attempt = input_pending.take().unwrap();
+                record_input_result(shared, &result, attempt);
                 result
             } else {
                 let command = command.unwrap();
@@ -765,21 +887,30 @@ fn actor_loop<B: Backend>(
                 shared.mailbox.lock().unwrap().timings.input_queue_ms =
                     command.queued.elapsed().as_millis() as u64;
                 match command.operation {
-                    Operation::Input(action, permit) => {
+                    Operation::Input(action, permit, receipt) => {
+                        let mut attempt = InputAttempt {
+                            actor_session: session,
+                            kind: action.kind(),
+                            queued: command.queued,
+                            began: Instant::now(),
+                            permit_expires: permit.expires_at(),
+                            receipt,
+                        };
                         let result = if permit.current_for(&active.authority) {
+                            attempt.receipt.began = true;
                             desktop.begin_input(action, permit)
                         } else {
                             Err(DesktopError::Cancelled)
                         };
                         let result = match result {
                             Ok(desktop::InputPoll::Pending) => {
-                                input_pending = true;
+                                input_pending = Some(attempt);
                                 break;
                             }
                             Ok(desktop::InputPoll::Complete) => Ok(()),
                             Err(error) => Err(error),
                         };
-                        record_input_result(shared, &result);
+                        record_input_result(shared, &result, attempt);
                         result
                     }
                     Operation::ClipboardRead(request, guard) => {
@@ -820,9 +951,9 @@ fn actor_loop<B: Backend>(
                     let mut mailbox = shared.mailbox.lock().unwrap();
                     mailbox.timings.rejected_inputs += 1;
                     if current(&mailbox, session) {
-                        mailbox
-                            .commands
-                            .retain(|command| !matches!(command.operation, Operation::Input(_, _)));
+                        mailbox.commands.retain(|command| {
+                            !matches!(command.operation, Operation::Input(_, _, _))
+                        });
                         mailbox.release = true;
                         shared.cancellation.fetch_add(1, Ordering::AcqRel);
                         shared.wake.notify_one();
@@ -936,7 +1067,7 @@ fn actor_loop<B: Backend>(
             next_capture = began + Duration::from_secs_f64(1.0 / active.fps.max(1) as f64);
         }
         let mailbox = shared.mailbox.lock().unwrap();
-        let wait = if input_pending {
+        let wait = if input_pending.is_some() {
             Duration::from_millis(2)
         } else if !mailbox.commands.is_empty() {
             Duration::ZERO
@@ -950,11 +1081,16 @@ fn actor_loop<B: Backend>(
         let _ = shared.wake.wait_timeout(mailbox, wait).unwrap();
     }
 }
-fn record_input_result(shared: &Shared, result: &desktop::Result<()>) {
+fn record_input_result(shared: &Shared, result: &desktop::Result<()>, mut attempt: InputAttempt) {
+    let finished = Instant::now();
+    attempt.receipt.complete(result);
     let mut mailbox = shared.mailbox.lock().unwrap();
     let count = match result {
         Ok(()) => &mut mailbox.timings.input_completed,
-        Err(DesktopError::InputExpired) => &mut mailbox.timings.input_expired,
+        Err(DesktopError::InputExpired) => {
+            mailbox.timings.last_input_expiry = Some(attempt.expiry(finished));
+            &mut mailbox.timings.input_expired
+        }
         Err(DesktopError::Cancelled) => &mut mailbox.timings.input_cancelled,
         Err(_) => &mut mailbox.timings.input_failed,
     };
@@ -1169,6 +1305,167 @@ mod tests {
             InputAction::Key(KeyCode::new(30).unwrap(), Transition::Press),
             permit,
         )
+    }
+
+    #[test]
+    fn tracked_key_reports_native_completion_and_queued_release() {
+        let (actor, _, inputs, _) = fixture(None);
+        let session = actor.activate(30, false);
+        wait_until(|| session.input_open());
+        let permit =
+            session.authorize(InputPermit::new(1, Instant::now() + Duration::from_secs(1)));
+        let result = session
+            .input_tracked(
+                InputAction::Key(KeyCode::new(30).unwrap(), Transition::Press),
+                permit,
+            )
+            .unwrap();
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputOutcome::Applied
+        );
+        assert_eq!(inputs.load(Ordering::Acquire), 1);
+        drop(session);
+        assert_eq!(
+            actor.shutdown(Duration::from_secs(1)),
+            ShutdownOutcome::Clean
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (actor, _, inputs, _) = fixture(Some(barrier.clone()));
+        let session = actor.activate(30, false);
+        barrier.wait();
+        session.authority.observe_lock(LockObservation {
+            outcome: Ok(desktop::KnownLock::Unlocked),
+            elapsed_us: 0,
+        });
+        let permit =
+            session.authorize(InputPermit::new(1, Instant::now() + Duration::from_secs(1)));
+        let result = session
+            .input_tracked(
+                InputAction::Key(KeyCode::new(30).unwrap(), Transition::Press),
+                permit,
+            )
+            .unwrap();
+        session.release();
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputOutcome::Aborted
+        );
+        barrier.wait();
+        assert_eq!(inputs.load(Ordering::Acquire), 0);
+        drop(session);
+        assert_eq!(
+            actor.shutdown(Duration::from_secs(1)),
+            ShutdownOutcome::Clean
+        );
+    }
+
+    #[test]
+    fn tracked_pending_button_release_reports_unknown_after_native_begin() {
+        let fixture = cooperative_fixture();
+        let session = fixture.actor.activate(100, false);
+        wait_until(|| session.input_open());
+        let permit =
+            session.authorize(InputPermit::new(1, Instant::now() + Duration::from_secs(1)));
+        let result = session
+            .input_tracked(
+                InputAction::Button(
+                    Position::new(0.5, 0.5).unwrap(),
+                    Button::Left,
+                    Transition::Press,
+                ),
+                permit,
+            )
+            .unwrap();
+        wait_until(|| fixture.started.load(Ordering::Acquire) == 1);
+        session.release();
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputOutcome::Unknown
+        );
+        assert_eq!(*fixture.events.lock().unwrap(), []);
+        drop(session);
+        assert_eq!(
+            fixture.actor.shutdown(Duration::from_secs(1)),
+            ShutdownOutcome::Clean
+        );
+    }
+
+    #[test]
+    fn tracked_queued_input_is_aborted_on_session_replacement() {
+        let barrier = Arc::new(Barrier::new(2));
+        let (actor, _, inputs, _) = fixture(Some(barrier.clone()));
+        let old = actor.activate(30, false);
+        barrier.wait();
+        old.authority.observe_lock(LockObservation {
+            outcome: Ok(desktop::KnownLock::Unlocked),
+            elapsed_us: 0,
+        });
+        let permit = old.authorize(InputPermit::new(1, Instant::now() + Duration::from_secs(1)));
+        let old_result = old
+            .input_tracked(
+                InputAction::Key(KeyCode::new(30).unwrap(), Transition::Press),
+                permit,
+            )
+            .unwrap();
+        let replacement = actor.activate(30, false);
+        assert_eq!(
+            old_result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputOutcome::Aborted
+        );
+        barrier.wait();
+        wait_until(|| replacement.input_open());
+        let permit =
+            replacement.authorize(InputPermit::new(1, Instant::now() + Duration::from_secs(1)));
+        let new_result = replacement
+            .input_tracked(
+                InputAction::Key(KeyCode::new(30).unwrap(), Transition::Press),
+                permit,
+            )
+            .unwrap();
+        assert_eq!(
+            new_result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputOutcome::Applied
+        );
+        assert_eq!(inputs.load(Ordering::Acquire), 1);
+        drop(old);
+        drop(replacement);
+        assert_eq!(
+            actor.shutdown(Duration::from_secs(1)),
+            ShutdownOutcome::Clean
+        );
+    }
+
+    #[test]
+    fn tracked_held_key_release_reports_completion_after_the_release() {
+        let fixture = held_actor(None, None, false);
+        let session = fixture.actor.activate(30, false);
+        wait_until(|| session.input_open());
+        for (transition, held, events) in [
+            (Transition::Press, vec![30], vec![(30, true)]),
+            (Transition::Release, vec![], vec![(30, true), (30, false)]),
+        ] {
+            let permit =
+                session.authorize(InputPermit::new(1, Instant::now() + Duration::from_secs(1)));
+            let result = session
+                .input_tracked(
+                    InputAction::Key(KeyCode::new(30).unwrap(), transition),
+                    permit,
+                )
+                .unwrap();
+            assert_eq!(
+                result.recv_timeout(Duration::from_secs(1)).unwrap(),
+                InputOutcome::Applied
+            );
+            assert_eq!(*fixture.held.lock().unwrap(), held);
+            assert_eq!(*fixture.events.lock().unwrap(), events);
+        }
+        drop(session);
+        assert_eq!(
+            fixture.actor.shutdown(Duration::from_secs(1)),
+            ShutdownOutcome::Clean
+        );
     }
 
     #[test]
@@ -2567,7 +2864,22 @@ mod tests {
         })
         .unwrap();
         let session = actor.activate(30, false);
-        press(&session).unwrap();
+        session.authority.observe_lock(LockObservation {
+            outcome: Ok(desktop::KnownLock::Unlocked),
+            elapsed_us: 0,
+        });
+        let permit =
+            session.authorize(InputPermit::new(1, Instant::now() + Duration::from_secs(1)));
+        let result = session
+            .input_tracked(
+                InputAction::Key(KeyCode::new(30).unwrap(), Transition::Press),
+                permit,
+            )
+            .unwrap();
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            InputOutcome::Unknown
+        );
         let mut reset = None;
         wait_until(|| {
             reset = session.poll().input_reset;
@@ -2578,6 +2890,15 @@ mod tests {
         assert_eq!(update.timings.rejected_inputs, 1);
         assert_eq!(update.timings.input_expired, 1);
         assert_eq!(update.timings.input_completed, 0);
+        let expiry = update.timings.last_input_expiry.unwrap();
+        assert_eq!(expiry.actor_session, 1);
+        assert_eq!(expiry.kind, InputKind::Key);
+        assert!(expiry.permit_remaining_at_dispatch_ms > 0);
+        assert!(expiry.native_ms >= 2);
+        assert_eq!(
+            serde_json::to_value(expiry).unwrap()["kind"],
+            serde_json::json!("key")
+        );
         assert!(update.fault.is_none());
         assert!(matches!(press(&session), Err(DesktopError::Cancelled)));
         assert_eq!(session.poll().timings.input_completed, 0);
@@ -2675,6 +2996,7 @@ mod tests {
         aborted: Arc<AtomicUsize>,
         pending: Option<(u32, InputPermit)>,
         failed: Arc<std::sync::atomic::AtomicBool>,
+        defer_permit_check: bool,
     }
     impl Backend for CooperativeInput {
         fn lock(&mut self, cancel: &Cancellation) -> LockObservation {
@@ -2727,7 +3049,9 @@ mod tests {
             permit: InputPermit,
         ) -> desktop::Result<desktop::InputPoll> {
             if let InputAction::Button(_, button, Transition::Press) = action {
-                permit.emit(1, || Ok(()))?;
+                if !self.defer_permit_check {
+                    permit.emit(1, || Ok(()))?;
+                }
                 self.pending = Some((
                     match button {
                         Button::Left => 272,
@@ -2750,6 +3074,9 @@ mod tests {
                 return Err(DesktopError::PointerPreparation(
                     desktop::PointerPreparationFault::Unavailable,
                 ));
+            }
+            if self.defer_permit_check && !self.ready.load(Ordering::Acquire) {
+                return Ok(desktop::InputPoll::Pending);
             }
             permit.emit(1, || Ok(()))?;
             if !self.ready.load(Ordering::Acquire) {
@@ -2784,6 +3111,9 @@ mod tests {
         failed: Arc<std::sync::atomic::AtomicBool>,
     }
     fn cooperative_fixture() -> CooperativeFixture {
+        cooperative_fixture_with_deferred_permit(false)
+    }
+    fn cooperative_fixture_with_deferred_permit(defer_permit_check: bool) -> CooperativeFixture {
         let frames = Arc::new(AtomicUsize::new(0));
         let events = Arc::new(Mutex::new(Vec::new()));
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2816,6 +3146,7 @@ mod tests {
                 aborted: a.clone(),
                 pending: None,
                 failed: failure.clone(),
+                defer_permit_check,
             })
         })
         .unwrap();
@@ -2859,6 +3190,47 @@ mod tests {
         wait_until(|| fixture.events.lock().unwrap().len() == 2);
         assert_eq!(*fixture.events.lock().unwrap(), [(272, true), (30, true)]);
         wait_until(|| session.poll().timings.input_completed == 2);
+        drop(session);
+        assert_eq!(
+            fixture.actor.shutdown(Duration::from_secs(1)),
+            ShutdownOutcome::Clean
+        );
+    }
+    #[test]
+    fn expired_pending_button_records_its_kind_and_permit_timing_without_input_contents() {
+        let fixture = cooperative_fixture_with_deferred_permit(true);
+        let session = fixture.actor.activate(100, false);
+        wait_until(|| session.input_open());
+        let permit = session.authorize(InputPermit::new(
+            1,
+            Instant::now() + Duration::from_millis(80),
+        ));
+        session
+            .input(
+                InputAction::Button(
+                    Position::new(0.5, 0.5).unwrap(),
+                    Button::Left,
+                    Transition::Press,
+                ),
+                permit,
+            )
+            .unwrap();
+        wait_until(|| fixture.started.load(Ordering::Acquire) == 1);
+        thread::sleep(Duration::from_millis(100));
+        fixture.ready.store(true, Ordering::Release);
+        wait_until(|| session.poll().timings.input_expired == 1);
+        let update = session.poll();
+        let expiry = update.timings.last_input_expiry.unwrap();
+        assert_eq!(expiry.actor_session, 1);
+        assert_eq!(expiry.kind, InputKind::Button);
+        assert!(expiry.permit_remaining_at_result_ms <= 0);
+        assert!(expiry.native_ms >= 80);
+        assert_eq!(update.timings.input_completed, 0);
+        assert_eq!(*fixture.events.lock().unwrap(), []);
+        let value = serde_json::to_value(expiry).unwrap();
+        assert_eq!(value["kind"], "button");
+        assert_eq!(value.as_object().unwrap().len(), 6);
+        assert!(value.get("key").is_none());
         drop(session);
         assert_eq!(
             fixture.actor.shutdown(Duration::from_secs(1)),

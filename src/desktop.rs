@@ -1,7 +1,11 @@
 use memmap2::MmapMut;
-use rustix::event::{PollFd, PollFlags, poll};
+use rustix::{
+    event::{PollFd, PollFlags, poll},
+    fs::{FallocateFlags, MemfdFlags, SealFlags},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::File,
     io::{Read, Write},
     os::fd::AsFd,
     process::{Child, Command, Stdio},
@@ -105,6 +109,131 @@ pub struct DesktopGeometry {
     pub scale: i32,
     pub transform: u32,
     pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Viewport {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    full_width: u32,
+    full_height: u32,
+}
+impl Viewport {
+    pub fn new(
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        full_width: u32,
+        full_height: u32,
+    ) -> Result<Self> {
+        let valid = width > 0
+            && height > 0
+            && packed_rgba_len(full_width, full_height).is_ok()
+            && x.checked_add(width)
+                .is_some_and(|right| right <= full_width)
+            && y.checked_add(height)
+                .is_some_and(|bottom| bottom <= full_height);
+        if !valid {
+            return Err(DesktopError::InvalidInput);
+        }
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+            full_width,
+            full_height,
+        })
+    }
+
+    pub fn centered(
+        geometry: &DesktopGeometry,
+        capture_width: u32,
+        capture_height: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        if geometry.scale != 1 || geometry.transform != 0 {
+            return Err(DesktopError::UnsupportedFormat);
+        }
+        if capture_width != geometry.width || capture_height != geometry.height {
+            return Err(DesktopError::StaleGeometry);
+        }
+        if width > capture_width || height > capture_height {
+            return Err(DesktopError::InvalidInput);
+        }
+        Self::new(
+            (capture_width - width) / 2,
+            (capture_height - height) / 2,
+            width,
+            height,
+            capture_width,
+            capture_height,
+        )
+    }
+
+    pub fn origin(self) -> (u32, u32) {
+        (self.x, self.y)
+    }
+
+    pub fn dimensions(self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub fn full_dimensions(self) -> (u32, u32) {
+        (self.full_width, self.full_height)
+    }
+
+    pub fn map_position(self, position: Position) -> Result<Position> {
+        let x = (self.x as f64 + position.x * (self.width - 1) as f64)
+            / (self.full_width - 1).max(1) as f64;
+        let y = (self.y as f64 + position.y * (self.height - 1) as f64)
+            / (self.full_height - 1).max(1) as f64;
+        Position::new(x, y)
+    }
+
+    pub fn crop_rgba(self, rgba: &[u8]) -> Result<Vec<u8>> {
+        if rgba.len() != packed_rgba_len(self.full_width, self.full_height)? {
+            return Err(DesktopError::InvalidFrame);
+        }
+        let row_bytes = (self.width as usize)
+            .checked_mul(4)
+            .ok_or(DesktopError::InvalidFrame)?;
+        let mut cropped = Vec::new();
+        cropped
+            .try_reserve_exact(packed_rgba_len(self.width, self.height)?)
+            .map_err(|_| DesktopError::InvalidFrame)?;
+        let bottom = self
+            .y
+            .checked_add(self.height)
+            .ok_or(DesktopError::InvalidFrame)?;
+        for row in self.y..bottom {
+            let offset = (row as usize)
+                .checked_mul(self.full_width as usize)
+                .and_then(|pixels| pixels.checked_add(self.x as usize))
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or(DesktopError::InvalidFrame)?;
+            let end = offset
+                .checked_add(row_bytes)
+                .ok_or(DesktopError::InvalidFrame)?;
+            cropped.extend_from_slice(rgba.get(offset..end).ok_or(DesktopError::InvalidFrame)?);
+        }
+        Ok(cropped)
+    }
+}
+
+fn packed_rgba_len(width: u32, height: u32) -> Result<usize> {
+    let len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(DesktopError::InvalidFrame)?;
+    if width == 0 || height == 0 || len > MAX_FRAME_BYTES {
+        return Err(DesktopError::InvalidFrame);
+    }
+    Ok(len)
 }
 #[derive(Clone, Debug, Default)]
 pub struct InputAuthority(Arc<Mutex<AuthorityState>>);
@@ -359,6 +488,9 @@ impl InputPermit {
         let phase = authority.0.lock().unwrap();
         phase.is_open() && phase.input.revision() == self.revision
     }
+    pub(crate) fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
     pub(crate) fn emit(&self, generation: u64, emit: impl FnOnce() -> Result<()>) -> Result<()> {
         let mut phase = self.authority.0.lock().unwrap();
         if phase.input.revision() != self.revision {
@@ -486,6 +618,22 @@ fn frame_size(width: u32, height: u32, stride: u32) -> Result<usize> {
         return Err(DesktopError::InvalidFrame);
     }
     Ok(len)
+}
+fn shared_memory_file(name: &str, len: usize) -> std::io::Result<File> {
+    let flags = MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING;
+    let fd = match rustix::fs::memfd_create(name, flags | MemfdFlags::NOEXEC_SEAL) {
+        Ok(fd) => fd,
+        // MFD_NOEXEC_SEAL was added in Linux 6.3. Older kernels reject the flag.
+        Err(rustix::io::Errno::INVAL) => rustix::fs::memfd_create(name, flags)?,
+        Err(error) => return Err(error.into()),
+    };
+    let file = File::from(fd);
+    file.set_len(len as u64)?;
+    rustix::fs::fallocate(&file, FallocateFlags::empty(), 0, len as u64)
+        .map_err(std::io::Error::from)?;
+    rustix::fs::fcntl_add_seals(&file, SealFlags::SHRINK | SealFlags::GROW)
+        .map_err(std::io::Error::from)?;
+    Ok(file)
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Position {
@@ -1075,8 +1223,7 @@ impl Desktop {
                     .shm
                     .as_ref()
                     .ok_or(DesktopError::MissingProtocol("wl_shm"))?;
-                let file = tempfile::tempfile()?;
-                file.set_len(len as u64)?;
+                let file = shared_memory_file("screenpier-capture", len)?;
                 // The compositor owns writes until Ready. Cancellation discards this allocation.
                 let mapping = unsafe { MmapMut::map_mut(&file)? };
                 let pool = shm.create_pool(file.as_fd(), len as i32, &self.queue.handle(), ());
@@ -1130,8 +1277,8 @@ impl Desktop {
             .seat
             .as_ref()
             .ok_or(DesktopError::MissingProtocol("wl_seat"))?;
-        let mut keymap_file = tempfile::tempfile()?;
         let text = self.keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        let mut keymap_file = shared_memory_file("screenpier-keymap", text.len() + 1)?;
         keymap_file.write_all(text.as_bytes())?;
         keymap_file.write_all(&[0])?;
         let keyboard = manager.create_virtual_keyboard(seat, &self.queue.handle(), ());
@@ -2675,6 +2822,29 @@ mod tests {
         }
     }
     #[test]
+    fn capture_backing_is_preallocated_outside_temporary_filesystem() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::fd::AsRawFd;
+
+        let len = frame_size(1920, 1080, 1920 * 4).unwrap();
+        let mut file = shared_memory_file("screenpier-capture", len).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), len as u64);
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        assert!(
+            path.to_string_lossy()
+                .starts_with("/memfd:screenpier-capture")
+        );
+        let seals = rustix::fs::fcntl_get_seals(&file).unwrap();
+        assert!(seals.contains(SealFlags::SHRINK | SealFlags::GROW));
+        file.seek(SeekFrom::Start(len as u64 - 1)).unwrap();
+        file.write_all(&[0x5a]).unwrap();
+        file.seek(SeekFrom::Start(len as u64 - 1)).unwrap();
+        let mut last = [0];
+        file.read_exact(&mut last).unwrap();
+        assert_eq!(last, [0x5a]);
+        assert!(file.set_len(0).is_err());
+    }
+    #[test]
     fn coordinates_preserve_edges_and_reject_invalid_numbers() {
         assert_eq!(
             Position::new(1.0, 1.0).unwrap().pixels(1920, 1080).unwrap(),
@@ -2687,6 +2857,95 @@ mod tests {
         for n in [f64::NAN, f64::INFINITY, -0.01, 1.01] {
             assert!(Position::new(n, 0.0).is_err());
         }
+    }
+    #[test]
+    fn centered_viewport_maps_local_corners_and_center_to_physical_pixels() {
+        let mut geometry = geometry();
+        geometry.width = 1920;
+        geometry.height = 1080;
+        let viewport = Viewport::centered(&geometry, 1920, 1080, 1280, 720).unwrap();
+        assert_eq!(viewport.origin(), (320, 180));
+        assert_eq!(viewport.dimensions(), (1280, 720));
+        assert_eq!(viewport.full_dimensions(), (1920, 1080));
+        for (local, expected) in [
+            ((0.0, 0.0), (320, 180)),
+            ((1.0, 0.0), (1599, 180)),
+            ((0.0, 1.0), (320, 899)),
+            ((1.0, 1.0), (1599, 899)),
+            ((0.5, 0.5), (960, 540)),
+        ] {
+            let full = viewport
+                .map_position(Position::new(local.0, local.1).unwrap())
+                .unwrap();
+            assert_eq!(full.pixels(1920, 1080).unwrap(), expected);
+        }
+        let center = viewport
+            .map_position(Position::new(0.5, 0.5).unwrap())
+            .unwrap();
+        assert_eq!((center.x, center.y), (0.5, 0.5));
+        let bottom_right = Viewport::new(640, 360, 1280, 720, 1920, 1080).unwrap();
+        let mapped = bottom_right
+            .map_position(Position::new(1.0, 1.0).unwrap())
+            .unwrap();
+        assert_eq!(mapped.pixels(1920, 1080).unwrap(), (1919, 1079));
+    }
+    #[test]
+    fn viewport_rejects_invalid_bounds_and_unsupported_capture_geometry() {
+        for (x, y, width, height, full_width, full_height) in [
+            (0, 0, 0, 1, 4, 4),
+            (0, 0, 1, 0, 4, 4),
+            (4, 0, 1, 1, 4, 4),
+            (0, 4, 1, 1, 4, 4),
+            (u32::MAX, 0, 1, 1, 4, 4),
+            (0, 0, 1, 1, u32::MAX, u32::MAX),
+        ] {
+            assert!(Viewport::new(x, y, width, height, full_width, full_height).is_err());
+        }
+        let mut geometry = geometry();
+        geometry.width = 1920;
+        geometry.height = 1080;
+        assert!(matches!(
+            Viewport::centered(&geometry, 1919, 1080, 1280, 720),
+            Err(DesktopError::StaleGeometry)
+        ));
+        geometry.scale = 2;
+        assert!(matches!(
+            Viewport::centered(&geometry, 1920, 1080, 1280, 720),
+            Err(DesktopError::UnsupportedFormat)
+        ));
+        geometry.scale = 1;
+        geometry.transform = 1;
+        assert!(matches!(
+            Viewport::centered(&geometry, 1920, 1080, 1280, 720),
+            Err(DesktopError::UnsupportedFormat)
+        ));
+        geometry.transform = 0;
+        assert!(matches!(
+            Viewport::centered(&geometry, 1920, 1080, 1921, 720),
+            Err(DesktopError::InvalidInput)
+        ));
+    }
+    #[test]
+    fn viewport_crops_exact_rgba_rows_and_rejects_bad_buffer_length() {
+        let viewport = Viewport::new(1, 1, 2, 2, 4, 3).unwrap();
+        let rgba: Vec<u8> = (0..12).flat_map(|pixel| [pixel, 0, 0, 255]).collect();
+        assert_eq!(
+            viewport.crop_rgba(&rgba).unwrap(),
+            vec![5, 0, 0, 255, 6, 0, 0, 255, 9, 0, 0, 255, 10, 0, 0, 255]
+        );
+        assert!(matches!(
+            viewport.crop_rgba(&rgba[..rgba.len() - 1]),
+            Err(DesktopError::InvalidFrame)
+        ));
+        assert!(matches!(
+            viewport.crop_rgba(&[rgba.as_slice(), &[0]].concat()),
+            Err(DesktopError::InvalidFrame)
+        ));
+        let single = Viewport::new(0, 0, 1, 1, 1, 1).unwrap();
+        let mapped = single
+            .map_position(Position::new(1.0, 1.0).unwrap())
+            .unwrap();
+        assert_eq!((mapped.x, mapped.y), (0.0, 0.0));
     }
     #[test]
     fn unmatched_releases_and_duplicate_presses_do_not_change_remote_state() {

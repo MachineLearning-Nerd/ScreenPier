@@ -16,6 +16,8 @@ node tests/client-lifecycle.cjs
 cargo build --release --bin screenpier
 ```
 
+The running host is Rust and serves an embedded browser page. JavaScript runs in the Mac browser; Node is only needed for the optional local browser test command above and the disposable test fixture, not for the ScreenPier service.
+
 The host needs FFmpeg, libxkbcommon, wl-clipboard, Hyprland's screencopy and virtual input protocols, and Tailscale. Run the application inside the existing graphical login. The current hardware encoder uses the Intel render device at `/dev/dri/by-path/pci-0000:00:02.0-render`.
 
 ## Start private access
@@ -66,13 +68,17 @@ If port 443 already serves another application, leave that route intact. Use por
 
 The **Quality** menu starts in **Clear text** (800 kbps, 15 fps). Choose **Low data** (560 kbps, 8 fps) on a slower link or **Smooth motion** (up to 2400 kbps, 20 fps) when motion matters. Switching reconnects the video session and releases held keys. If Smooth falls behind, the app returns to Clear text. These are fixed profiles within the host's bitrate cap; link-speed detection is still experimental.
 
+The development branch also offers **Focus view**, an experimental 1280 × 720 native-pixel window into the same physical display. Its pan buttons move the view without changing the Linux workspace. It needs scale-1, unrotated output geometry. Focus is clearer in local low-bandwidth tests but still has stale-frame control gaps at 0.5 Mbps with packet loss; the installed private service does not include it. See [the measured results](docs/viewport-prototype.md).
+
+**Actual size** shows each captured desktop pixel at one CSS pixel, so a smaller browser window displays a scrollable portion of the desktop without shrinking text. The wheel and touch gestures pan this view. Uncheck **Wheel pans view** to send wheel scrolling to Linux; choose **Fit screen** to restore touch control of Linux. Actual size avoids browser downscaling but cannot restore detail already lost during video compression.
+
 **Mac Command sends Ctrl** maps Command shortcuts to Linux Control shortcuts. Uncheck it to send Linux Super. Comet and macOS can reserve some shortcuts before the page sees them. Physical key mapping currently uses US layout. Exchange non-ASCII text through the clipboard buttons.
 
 **Paste to Linux** copies your browser's text clipboard into Linux's clipboard. Then paste inside the Linux application. **Copy from Linux** copies Linux clipboard text into your Mac clipboard. Browser permission is required. Text is limited to 64 KiB, with an additional 72 KiB encoded-message limit. Clipboard exchange is disabled while locked or when lock state is unknown.
 
 Only one tab controls the desktop. **Take control** replaces the current controller and releases its held keys and buttons. **Disconnect** releases remote input. A stale displayed image pauses control.
 
-The computer must remain awake and signed into Hyprland. An authenticated production connection wakes the monitor through Omarchy. Enter your password only into the ordinary Linux lock screen. Remote unlock passed a Mac Comet check on an earlier binary with the same lock and input handling; this quality-mode build still needs a Mac check. Later graphical-session lifecycle cases remain open.
+The computer must remain awake and signed into Hyprland. An authenticated production connection wakes the monitor through Omarchy. Enter your password only into the ordinary Linux lock screen. Remote unlock and quality-mode control passed Mac Comet checks. The user found Smooth motion clear and small text readable in Clear text with Actual size; low-bandwidth reliability still needs work. Later graphical-session lifecycle cases remain open.
 
 ## Stop access
 
@@ -91,8 +97,10 @@ The HTTP listener binds to `127.0.0.1:6080`. WebRTC media binds separately to th
 
 If admission is rejected, check the exact owner login and HTTPS origin. If video is unavailable, check the selected monitor, encoder, and private UDP route. The browser retries transient connection failures for up to one minute. Disconnect cancels recovery. Admission rejection and another controller owning the desktop require an explicit action. A sustained foreground video stall triggers bounded recovery even when control messages continue. If recovery stops, reconnect explicitly. The host status endpoint `/api/status` requires the same owner authentication.
 
-Start with `--diagnostics-log ./screenpier.jsonl` to record numeric timing and input counters. The writer runs separately from transport and uses a bounded queue. It creates an owner-only file, rejects symbolic links, and truncates that configured file when it reaches 8 MiB. A logger failure does not interrupt desktop control. `/api/status` reports dropped records and logger failure.
+Start with `--diagnostics-log ./screenpier.jsonl` to record numeric timing and input counters. Peer records use schema version 4 and mark terminal session snapshots; readiness records use version 3. Both carry a random numeric `trace_id` that separates sessions across host restarts. Both include the outgoing video stream's sampled queue size and oldest unsent packet age. This queue also includes retransmissions and padding. `sample_age_ms` indicates how recent that snapshot is. The writer runs separately from transport and uses a bounded queue. It creates an owner-only file, rejects symbolic links, and truncates that configured file when it reaches 8 MiB. A logger failure does not interrupt desktop control. `/api/status` reports dropped records and logger failure.
+
+Run `python3 tools/readiness_summary.py screenpier.jsonl` to count every input-readiness interruption from event records. The output separates completed gaps, a gap ending with the session, and a gap still open at the last observation. `coverage: complete` means the event history is intact from first readiness to a recorded session end; it does not mean control stayed ready. Terminal peer timestamps have millisecond precision, so the tool reports a duration range for a gap ending there. It marks missing or dropped records as partial evidence. The tool uses only Python's standard library (Python 3.10 or later).
 
 Logs include capture, encoding, presentation age, transport scheduling, and input receipt, admission, expiry, cancellation, and backend completion counts. Backend completion does not prove the target application received an event. Duration fields ending in `last_ms` contain the latest sample. Scheduling fields ending in `max_ms` contain the session maximum. Desktop actor counters accumulate for the host lifetime. Logs exclude keys, clipboard contents, passwords, desktop images, controller credentials, and negotiation data.
 
-Audio, IME composition, access before graphical login, and remote power-on are not included. The installed user service is enabled for `graphical-session.target`; its automatic start after a fresh graphical login still needs a real login test. Performance budgets are targets until measured on the actual Mac route.
+Audio, IME composition, access before graphical login, and remote power-on are not included. The installed user service started after a fresh graphical login. Performance budgets remain targets until measured on the actual Mac route.

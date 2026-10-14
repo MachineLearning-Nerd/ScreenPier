@@ -1,0 +1,56 @@
+# Optional native-pixel viewport experiment
+
+ScreenPier's current Low data stream sends the whole 1920 by 1080 physical output at 560 kbps and 8 capture frames per second. Five guarded 0.5 Mbps route-change runs delivered the test key in only three sessions. A 400 kbps whole-output screen failed the current-video detail check even on the fast starting route. The installed service remains the whole-output implementation. This document describes a **branch-only prototype**, not a verified performance claim.
+
+## Intended behavior
+
+An optional focus view would encode a movable 1280 by 720 rectangle of the **same physical output**, at native source pixels. The physical Linux monitor, applications, and workspaces would remain the only desktop. The browser would show where the rectangle sits and provide explicit pan controls; whole-output viewing would remain available. At 400 kbps, this rectangle has about 1.6 times the nominal bits per source pixel of a 560 kbps 1920 by 1080 stream, while consuming fewer network bits. Encoder behavior and actual readability must be measured; this arithmetic is not a quality result.
+
+The first prototype supports only outputs whose captured pixel dimensions equal their logical geometry with scale 1 and normal transform. Unsupported geometry fails before control. Capture remains full-output, followed by a bounded RGBA crop before the H.264 encoder. This reduces encoded pixels and transmitted data but does not yet reduce compositor capture or full-frame conversion cost.
+
+## Coordinate and authority contract
+
+Each encoded frame identity must bind its RTP timestamp, output generation, content revision, capture time, and viewport rectangle. The host, not the browser, owns the rectangle. Frame metadata can tell the browser what it shows; input coordinates must be transformed using the rectangle stored with the **acknowledged frame identified by the input RTP**, never a mutable current pan setting. Check the rectangle bounds and map its native pixels into full-output normalized coordinates before the existing Wayland pointer, button, and scroll path. Key events need the same frame and authority proof but no coordinate transform.
+
+A pan request revokes held input, increments the input revision, and blocks new control until a frame for the new viewport is displayed and acknowledged. Old acknowledgements or commands cannot reopen the new view. A lock transition, monitor change, controller takeover, disconnect, or failed capture discards the viewport proof and releases held input as it does for the full output. A crop session must reject coordinate commands without RTP proof; an already-open older tab can only keep the full-output protocol. Clipboard permission stays tied to the verified unlocked desktop and is independent of viewport panning.
+
+The content freshness comparison uses pixels inside the viewport. Changes outside it cannot invalidate a genuinely unchanged displayed crop. Inside it, the existing 500 ms changed-content limit, 750 ms capture-health limit, heartbeat, lock, and revision gates remain. Do not extend deadlines to make a delayed stream appear responsive.
+
+## First guarded results
+
+The branch prototype uses an optional 1280 by 720 native-pixel crop at a 400 kbps cap and 8 capture frames per second. Its pan controls move by half a viewport and stop at the physical output edges. Rust mapping/authority tests and browser pan-order tests pass. These are isolated Linux Chromium fixture runs, not Mac Comet or tailnet acceptance:
+
+| Route after a 5 Mbps start | Focus result | Full-output result |
+| --- | --- | --- |
+| 0.5 Mbps, 200 ms RTT, no loss | One Focus run completed all three phases with exact `z` key transitions and literal OCR of 12, 14, and 16 px text in all phases. It had one display-expiry fall lasting 212 ms. | One Low data run completed exact `z` transitions, but 16 px OCR missed in every phase and 12 px OCR missed after restoration. It had two display-expiry falls. |
+| 1 Mbps, 150 ms RTT, 1% loss | One Focus run completed exact `z` transitions and all nine OCR checks, with three display-expiry falls; longest completed gap 437 ms. | Not compared here. |
+| 0.5 Mbps, 200 ms RTT, 2% loss | The first 8 fps Focus run passed initial input/OCR but lost its constrained click and key: the displayed frame was already 483 ms old before the click, and all five actions were denied at host admission. A later 8 fps run completed all phases with exact `z` and all nine OCR checks, but had 25 display-expiry falls, a longest completed gap of 1.47 seconds, and input ready in only 13 of 18 constrained one-second samples. A 12 fps experiment failed the constrained phase with control unavailable at its end; 8 fps was restored. | An independent Low data baseline run reached current video but ended the constrained phase with control unavailable. Earlier five-run evidence appears in [low-bandwidth work](low-bandwidth-work.md). |
+
+The earlier 8 fps artifact was `c298c96f56f01e4d40a80f53eb8beac27e4ef0b88225ad78992b1ccfc921dcb2`; it includes a browser pan-stall fix. The failed first 2% run used an earlier artifact with the same media settings, and the 12 fps result used `0af6cd08a6c4fe0f966d5325dafe742534e21f015600fa99d507b6478997c504`. The no-loss, 1%, and later 2% receipts are in `.audit/receipts/` under `screenpier-focus-noloss01`, `screenpier-focus-1mbps01`, and `screenpier-focus-capturetime01`. A separate 300 kbps Focus cap also lost the constrained `z` at 2% loss, despite reporting input ready before the click; its displayed frame was 393 ms old beforehand. Reducing the bitrate alone did not solve input delivery. The local Chromium callback did not provide `captureTime`, so the browser cannot use that optional metadata to predict this frame's remaining input lifetime.
+
+## Input outcomes and five-pair comparison
+
+The latest **isolated, uninstalled** artifact is `a1b059237b6a71b9507fb4591fa0e6ca33babf34d1d17e477b761fbf2c74f7a8`. It adds a bounded result ID to each key and button transition. The host reports `applied` only after its native call completes; it reports `rejected`, `aborted`, or `unknown` for the other terminal cases. These outcomes establish native emission, not target-application consumption. The browser pauses control on an unsuccessful or missing outcome and never replays the action. If a connection resets while IDs are still unconfirmed, their outcome is unknown and the browser requires a manual reconnect. A later reset cannot silently clear an earlier input failure. A command blocked before browser send is distinguished from one with an unknown native outcome. The host queues results for processed commands before its reset notice; a packet still in flight across reset cannot have an individual delivery guarantee.
+
+The latest artifact passed one guarded 1 Mbps / 150 ms RTT / 1% loss run and one 0.5 Mbps / 200 ms RTT / 2% loss run with exact native click and `z`, twelve `applied` outcomes, and all nine 12–16 px OCR checks in each run. The one-off receipts are `screenpier-final-clientfix-1m01` and `screenpier-final-clientfix-loss02` in `.audit/receipts/`. The 0.5 Mbps run still had 14 display-expiry falls and a 778 ms completed gap. A prior artifact (`29990903b6508113986e02823745a3f7b67b8736254973496b548f9d7c112ee7`) with the same capture, encoder, transport, and input-outcome host code but earlier browser failure wording was used for five alternating pairs against the installed Actual size binary (`89d99b3550c4212363eaa085169446d8dcc5ea4a438fa0f13df80c7a61fae7fb`) in Low data mode. Every pair started at 5 Mbps, changed to 0.5 Mbps with 200 ms RTT and 2% loss, then restored 5 Mbps. The complete run index is `.audit/receipts/screenpier-final-pairs-loss02-runs.json`; individual JSON, logs, screenshots, and OCR summaries are in that ignored directory.
+
+| Five-run measure | Focus view | Whole-output Low data |
+| --- | ---: | ---: |
+| Completed all three phases with exact native input | 4/5 | 1/5 |
+| Constrained one-second samples ready, median (range) of 18 | 17 (14–18) | 10 (7–16) |
+| Display-expiry falls per run, median (range) | 15 (11–42) | 18 (12–31) |
+| Longest completed unready gap per run, median (range) | 580 ms (438–1398) | 760 ms (555–935) |
+| Median presented age per run, median (range) | 298 ms (279–341) | 395 ms (280–415) |
+| Current post-route video, median (range) | 629 ms (391–1461) | 644 ms (520–772) |
+| Proxy queue drops | 0 in every run | 0 in every run |
+
+All four completed Focus runs read 12, 14, and 16 px text exactly in all three phases. The one completed Low data run missed 16 px text in all phases and 12 px text after restoration. The failed Focus run began its constrained input check with the browser apparently ready but the host awaiting a current display: the acknowledged frame was 546 ms old. All four click/key outcomes were `rejected`, and the fixture received no `z`. The four failed Low data runs ended the constrained phase without input readiness. These are local Chromium fixture results; neither mode has passed this weak-link reliability target. Focus still reached 42 display-expiry falls and a 1.40-second completed gap in one successful run. No CPU comparison was captured, and full-output capture still precedes the Focus crop. A Mac Comet Focus check has not been run.
+
+A separate two-second H.264 keyframe-interval experiment (`c45d244af06d3b155f9f9b73bb3f8438fe3befa13630777bbfb2fb747d99c4e3`) failed its first identical 0.5 Mbps / 2% loss route: the constrained phase ended without control readiness, with 29 display-expiry falls, a four-second completed gap, and 13/18 ready samples. Its receipt is `screenpier-gop2-loss02-single`. The change was reverted; rebuilding the pre-client-fix source reproduced `29990903...` exactly. One failed experiment does not estimate its failure rate, but provides no basis to replace the existing encoder setting.
+
+## Acceptance before deployment
+
+1. Prove pixel mapping at every viewport corner and center, including pan while a button or modifier is held. Verify release and no click at a stale location. Test missing RTP, old revision, old generation, delayed ACK, lock, reconnect, and unsupported output geometry.
+2. Run the guarded physical-desktop route profile with the same 5 Mbps start, 0.5 Mbps constrained phase, 200 ms added RTT, and 2 percent loss. Alternate five whole-output baseline and viewport runs. Require current video within five seconds, exact native fixture input transitions, readable 14 px text, bounded queues, and no diagnostic failures. Report all failed runs. The first five-pair comparison above failed this gate; repeat it after a measured media-path correction.
+3. Compare app and wire bytes, encoder/capture cost, displayed-frame age, and readiness-fall time. The two geometries serve different viewing experiences, so label their results explicitly. If panning makes ordinary Linux browser testing impractical, reject the feature even if network numbers improve.
+4. Validate the accepted candidate in the actual Mac Comet tailnet route, including text, panning, shortcuts, lock/unlock, and recovery. Keep the installed service unchanged until this succeeds and a separate deployment decision is made.
