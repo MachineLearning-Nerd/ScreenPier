@@ -10,7 +10,6 @@ wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 memmap2 = "0.9"
-tempfile = "3"
 xkbcommon = "0.9"
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process"] }
 thiserror = "2"
@@ -24,3 +23,6 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 rand = "0.9"
 str0m = { version = "=0.24.1", default-features = false, features = ["rust-crypto"] }
+
+[dev-dependencies]
+tempfile = "3"

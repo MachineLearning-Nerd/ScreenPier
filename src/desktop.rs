@@ -1,7 +1,11 @@
 use memmap2::MmapMut;
-use rustix::event::{PollFd, PollFlags, poll};
+use rustix::{
+    event::{PollFd, PollFlags, poll},
+    fs::{FallocateFlags, MemfdFlags, SealFlags},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::File,
     io::{Read, Write},
     os::fd::AsFd,
     process::{Child, Command, Stdio},
@@ -486,6 +490,22 @@ fn frame_size(width: u32, height: u32, stride: u32) -> Result<usize> {
         return Err(DesktopError::InvalidFrame);
     }
     Ok(len)
+}
+fn shared_memory_file(name: &str, len: usize) -> std::io::Result<File> {
+    let flags = MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING;
+    let fd = match rustix::fs::memfd_create(name, flags | MemfdFlags::NOEXEC_SEAL) {
+        Ok(fd) => fd,
+        // MFD_NOEXEC_SEAL was added in Linux 6.3. Older kernels reject the flag.
+        Err(rustix::io::Errno::INVAL) => rustix::fs::memfd_create(name, flags)?,
+        Err(error) => return Err(error.into()),
+    };
+    let file = File::from(fd);
+    file.set_len(len as u64)?;
+    rustix::fs::fallocate(&file, FallocateFlags::empty(), 0, len as u64)
+        .map_err(std::io::Error::from)?;
+    rustix::fs::fcntl_add_seals(&file, SealFlags::SHRINK | SealFlags::GROW)
+        .map_err(std::io::Error::from)?;
+    Ok(file)
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Position {
@@ -1075,8 +1095,7 @@ impl Desktop {
                     .shm
                     .as_ref()
                     .ok_or(DesktopError::MissingProtocol("wl_shm"))?;
-                let file = tempfile::tempfile()?;
-                file.set_len(len as u64)?;
+                let file = shared_memory_file("screenpier-capture", len)?;
                 // The compositor owns writes until Ready. Cancellation discards this allocation.
                 let mapping = unsafe { MmapMut::map_mut(&file)? };
                 let pool = shm.create_pool(file.as_fd(), len as i32, &self.queue.handle(), ());
@@ -1130,8 +1149,8 @@ impl Desktop {
             .seat
             .as_ref()
             .ok_or(DesktopError::MissingProtocol("wl_seat"))?;
-        let mut keymap_file = tempfile::tempfile()?;
         let text = self.keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        let mut keymap_file = shared_memory_file("screenpier-keymap", text.len() + 1)?;
         keymap_file.write_all(text.as_bytes())?;
         keymap_file.write_all(&[0])?;
         let keyboard = manager.create_virtual_keyboard(seat, &self.queue.handle(), ());
@@ -2673,6 +2692,29 @@ mod tests {
         ] {
             assert!(frame_size(w, h, s).is_err());
         }
+    }
+    #[test]
+    fn capture_backing_is_preallocated_outside_temporary_filesystem() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::fd::AsRawFd;
+
+        let len = frame_size(1920, 1080, 1920 * 4).unwrap();
+        let mut file = shared_memory_file("screenpier-capture", len).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), len as u64);
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        assert!(
+            path.to_string_lossy()
+                .starts_with("/memfd:screenpier-capture")
+        );
+        let seals = rustix::fs::fcntl_get_seals(&file).unwrap();
+        assert!(seals.contains(SealFlags::SHRINK | SealFlags::GROW));
+        file.seek(SeekFrom::Start(len as u64 - 1)).unwrap();
+        file.write_all(&[0x5a]).unwrap();
+        file.seek(SeekFrom::Start(len as u64 - 1)).unwrap();
+        let mut last = [0];
+        file.read_exact(&mut last).unwrap();
+        assert_eq!(last, [0x5a]);
+        assert!(file.set_len(0).is_err());
     }
     #[test]
     fn coordinates_preserve_edges_and_reject_invalid_numbers() {
