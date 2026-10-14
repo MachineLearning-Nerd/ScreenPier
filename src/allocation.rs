@@ -71,9 +71,13 @@ impl AllocationController {
     }
 
     pub(crate) fn observe(&mut self, observation: BandwidthObservation) {
-        self.latest = Some(observation);
+        self.record(observation);
         let candidate = allocation_for(observation.estimate_bps, self.maximum_kbps);
         self.refresh_pending(candidate, observation.observed_at);
+    }
+
+    pub(crate) fn record(&mut self, observation: BandwidthObservation) {
+        self.latest = Some(observation);
     }
 
     fn refresh_pending(&mut self, candidate: Allocation, now: Instant) {

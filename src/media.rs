@@ -969,9 +969,6 @@ impl Peer {
     }
 
     fn observe_bandwidth(&mut self, estimate: BweKind, now: Instant) {
-        if matches!(self.rate_mode, RateMode::Fixed { .. }) {
-            return;
-        }
         let (estimate, kind) = match estimate {
             BweKind::Twcc {
                 estimate,
@@ -980,11 +977,16 @@ impl Peer {
             BweKind::Remb { estimate, .. } => (estimate, EstimateKind::Remb),
             _ => return,
         };
-        self.allocation.observe(BandwidthObservation {
+        let observation = BandwidthObservation {
             estimate_bps: estimate.as_u64(),
             observed_at: now,
             kind,
-        });
+        };
+        if matches!(self.rate_mode, RateMode::Fixed { .. }) {
+            self.allocation.record(observation);
+        } else {
+            self.allocation.observe(observation);
+        }
     }
 
     fn request_keyframe(&mut self, now: Instant) {
@@ -1649,6 +1651,12 @@ mod tests {
             Allocation { kbps: 800, fps: 15 }
         );
         assert_eq!(peer.allocation.pending(), None);
+        let (log, receiver) = DiagnosticsLog::stalled();
+        peer.log_snapshot(Some(&log), Instant::now());
+        let crate::diagnostics::LogRecord::Peer(record) = receiver.try_recv().unwrap() else {
+            panic!("peer diagnostic record required");
+        };
+        assert_eq!(record.bwe_estimate_bps, Some(100_000));
     }
     fn known_authority() -> crate::desktop::InputAuthority {
         let authority = crate::desktop::InputAuthority::default();
